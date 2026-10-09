@@ -1,0 +1,42 @@
+# Sourced by kit-shell (and setup.sh): points everything at ~/.local/kit.
+# Own XDG dirs keep the remote's existing ~/.config, ~/.zshrc, nvim, ... untouched.
+KIT="${KIT:-$HOME/.local/kit}"
+export KIT KIT_ACTIVE=1
+
+if [ "$(cat "$KIT/mode" 2>/dev/null)" = local ]; then
+  # your own Linux machine: the real ~/.config and ~/.fizsh (the ones kit tracks)
+  export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+  export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+  export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+  export ZDOTDIR="$HOME/.fizsh"
+else
+  export XDG_CONFIG_HOME="$KIT/config"
+  export XDG_DATA_HOME="$KIT/data"
+  export XDG_STATE_HOME="$KIT/state"
+  export XDG_CACHE_HOME="$KIT/cache"
+  export ZDOTDIR="$KIT/fizsh"
+  export STARSHIP_CONFIG="$KIT/config/starship.toml"
+fi
+export ZELLIJ_CONFIG_DIR="$XDG_CONFIG_HOME/zellij"
+export EDITOR=nvim
+export SHELL="$KIT/bin/fizsh"
+
+# tools from packages.json, installed by mise inside the kit
+export MISE_DATA_DIR="$KIT/mise" MISE_CACHE_DIR="$KIT/cache/mise" MISE_STATE_DIR="$KIT/state/mise"
+export MISE_GLOBAL_CONFIG_FILE="$KIT/mise.toml"
+# Rust (only installed when a tool has to be built from source) also stays inside the kit;
+# no cargo-binstall: it would fetch the same prebuilt binary that didn't run here
+export RUSTUP_HOME="$KIT/rustup" CARGO_HOME="$KIT/cargo" MISE_CARGO_BINSTALL=false
+
+case ":$PATH:" in
+  *":$KIT/bin:"*) ;;
+  *) export PATH="$KIT/bin:$KIT/opt/nvim/bin:$KIT/opt/zsh/bin:$KIT/mise/shims:$PATH" ;;
+esac
+
+# kitty's terminfo and shell integration travel with the kit
+# (trailing ':' keeps the system terminfo database too)
+export TERMINFO_DIRS="$KIT/share/terminfo:${TERMINFO_DIRS:-}"
+if [ "$TERM" = xterm-kitty ] && [ -d "$KIT/share/kitty/shell-integration" ]; then
+  export KITTY_INSTALLATION_DIR="$KIT/share/kitty"
+fi

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Starts your shell (fizsh = zsh with ZDOTDIR) from the kit.
+# Installed as ~/.local/kit/bin/kit-shell and ~/.local/kit/bin/fizsh.
+#   kit-shell --ok   exits 0 only if the kit's zsh actually runs (used by the login hook,
+#                    so a broken kit never locks you out: you just get your normal shell)
+KIT="${KIT:-$HOME/.local/kit}"
+ZSH_BIN="$KIT/opt/zsh/bin/zsh"
+
+if [ "${1:-}" = "--ok" ]; then
+  "$ZSH_BIN" -fc true >/dev/null 2>&1
+  exit $?
+fi
+
+. "$KIT/bin/kit-env"
+exec -a fizsh "$ZSH_BIN" "$@"
