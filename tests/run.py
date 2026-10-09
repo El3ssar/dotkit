@@ -2032,38 +2032,12 @@ def cli_version_and_help(sb):
 
 
 @test
-def cli_removed_commands_redirect(sb):
-    m = setup(sb)
-    redirects = {"apply": "kit sync", "re-add": "kit save", "forget": "kit rm", "ignore": "kit rm",
-                 "diff": "kit status <file>", "update": "kit sync", "restore": "kit undo",
-                 "remote": "kit push", "pkg": "kit rm", "doctor": "kit status"}
-    for cmd, hint in redirects.items():
-        r = m.kit(cmd, code=2)
-        has(r.err, hint)
-    for cmd in ("cd", "git", "edit", "cat", "managed", "unmanaged", "verify", "scripts", "shell", "source-path"):
-        r = m.kit(cmd, code=2)
-        has(r.err, "kit ")
-        hasnt(r.err, "did you mean")
-    r = m.kit("diff", "~/.zshrc", code=2)
-    has(r.err, "kit status <file>")
-    r = m.kit("pkg", "add", "foo", code=2)
-    has(r.err, "kit add", "kit rm")
-
-
-@test
 def cli_typo_suggests(sb):
     m = setup(sb)
     r = m.kit("stauts", code=2)
     has(r.err, "did you mean 'status'")
     r = m.kit("snyc", code=2)
     has(r.err, "did you mean 'sync'")
-
-
-@test
-def cli_chezmoi_hints(sb):
-    m = setup(sb)
-    r = m.kit("merge", code=2)
-    has(r.err, "kit has no 'merge'")
 
 
 @test

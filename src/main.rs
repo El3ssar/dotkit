@@ -28,34 +28,6 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use cli::{build_cli, Args};
 use util::*;
 
-/// Commands kit doesn't have (older kit's, or chezmoi's), and what to use instead.
-const HINTS: &[(&str, &str)] = &[
-    ("apply", "kit sync (or kit undo <file> to take the repo's version of one file)"),
-    ("update", "kit sync"),
-    ("re-add", "kit save"),
-    ("forget", "kit rm"),
-    ("ignore", "kit rm (inside a tracked folder it also stops it showing up as new)"),
-    ("diff", "kit status <file>"),
-    ("restore", "kit undo"),
-    ("remote", "kit push"),
-    ("pkg", "kit add <tool> / kit rm <tool>"),
-    ("doctor", "kit status"),
-    ("managed", "kit status -v"),
-    ("unmanaged", "kit status"),
-    ("verify", "kit status"),
-    ("edit", "edit the file, then kit save"),
-    ("cd", "the repo is in ~/.local/share/kit"),
-    ("git", "the repo is in ~/.local/share/kit"),
-    ("cat", "kit status <file>"),
-    ("source-path", "the repo is in ~/.local/share/kit"),
-    ("scripts", "scripts run with kit sync; kit status shows the ones waiting"),
-    ("shell", "kit sync sets up the shell environment on Linux"),
-    ("merge", "kit sync merges files changed on both machines"),
-    ("chattr", "edit packages or rules in the repo (~/.local/share/kit)"),
-    ("data", "per-platform edits live in rules.json (see README)"),
-    ("execute-template", "kit has no templates: rules.json does per-platform edits"),
-    ("purge", "kit rm, then delete ~/.local/share/kit"),
-];
 
 /// Edit distance where swapping two neighbouring letters counts as one typo.
 fn typo_distance(a: &str, b: &str) -> usize {
@@ -95,9 +67,6 @@ fn usage_error(e: clap::Error, argv: &[String]) -> ! {
                 Some(ContextValue::String(s)) => s.clone(),
                 _ => String::new(),
             };
-            if let Some((_, hint)) = HINTS.iter().find(|(n, _)| *n == bad) {
-                die_code(&format!("kit has no '{bad}': {hint}"), 2);
-            }
             let parent = build_cli();
             let scope = match argv.first() {
                 Some(first) if first != &bad => parent.find_subcommand(first).cloned().unwrap_or_else(build_cli),
@@ -151,9 +120,6 @@ fn main() {
             out(&lines.join("\n"));
         }
         return;
-    }
-    if argv.len() >= 2 && (argv[0] == "add" || argv[0] == "rm") && argv[1] == "pkg" {
-        argv.remove(1); // older kit: `kit add pkg <tool>`
     }
     if argv.first().map(String::as_str) == Some("help") {
         argv = argv[1..].iter().take(2).cloned().chain(["--help".to_string()]).collect();
