@@ -205,7 +205,7 @@ while read -r name bin primary fallback <&3; do
   warn "$name: no build of it runs on this system (log: $KIT/state/kit-mise.log)"
 done 3< "$P/packages.list"
 
-# git checkouts the shell needs (externals.json: antidote, ...); on your own machine kit apply does this
+# git checkouts the shell needs (externals.json: antidote, ...); on your own machine kit sync does this
 [ "$MODE" = remote ] && while read -r rel url ref; do
   [ -n "$rel" ] || continue
   dest="$KIT/fizsh/${rel#.fizsh/}"
@@ -268,7 +268,7 @@ done
 nvim_step parsers 600 "+lua pcall(function() require('nvim-treesitter').install(require('astrocore').config.treesitter.ensure_installed):wait(540000) end)"
 [ -x "$KIT/config/nvim/bin/cbonsai.sh" ] && bash "$KIT/config/nvim/bin/cbonsai.sh" --help >/dev/null 2>&1 || true
 
-# --- login hook (servers always; your own Linux machine only with `kit shell install`) ----
+# --- login hook (servers only; KIT_HOOK=0 on your own Linux machine) ----
 if [ "${KIT_HOOK:-1}" = 1 ]; then bash "$P/remote/hook.sh" install; fi
 
 # --- report: everything that should be here, actually running? ---------------

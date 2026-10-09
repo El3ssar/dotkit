@@ -1,8 +1,7 @@
 # dotkit
 
-`kit` keeps your dotfiles, packages and shell the same on every machine. It works like
-chezmoi (a git repo is the source of truth; `status` / `diff` / `apply` / `re-add`), and it also
-installs your tools everywhere and can push your whole environment to a Linux server over ssh.
+`kit` keeps your dotfiles, tools and shell the same on every machine: a git repo holds them,
+each machine syncs with it, and `kit push` puts your whole environment on a Linux server.
 
 ## Install
 ```bash
@@ -11,88 +10,74 @@ curl -fsSL https://raw.githubusercontent.com/El3ssar/dotkit/main/install.sh | sh
 Prebuilt for macOS (Apple Silicon / Intel) and Linux (x86_64 / arm64, static, any distro).
 With Rust: `cargo install dotkit` (the command is `kit`).
 
-New machine, existing kit repo, in one go:
+New machine, existing repo, in one go:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/El3ssar/dotkit/main/install.sh | sh -s -- git@github.com:you/dotfiles.git
 ```
 
-## Start
+## Commands
+| | |
+|---|---|
+| `kit init [url]` | start a repo, set this machine up from yours, or set where it's backed up |
+| `kit add <file\|folder\|tool>` | track it; a tool (`kit add lazygit`) is installed here and on every machine |
+| `kit rm <file\|folder\|tool>` | stop tracking (nothing is deleted) |
+| `kit status [file]` | what changed here or in the repo; with a file, its diff ([delta](https://github.com/dandavison/delta)) |
+| `kit save [file]` | keep this machine's changes: copy them into the repo |
+| `kit sync` | back up what you saved, get what other machines saved |
+| `kit undo [file]` | with a file: take the repo's version; alone: put back what the last sync replaced |
+| `kit push [host]` | your environment on a server; no host: all your servers |
+
+## How it goes
 ```bash
-kit init                          # new repo in ~/.local/share/kit
-kit add ~/.zshrc ~/.config/nvim   # track files and folders
-kit add pkg ripgrep               # install a tool here, remember it for every machine
-kit git remote add origin <url-of-an-empty-private-repo>
-kit save                          # commit + push: your backup
+kit init                                  # new repo in ~/.local/share/kit
+kit add ~/.zshrc ~/.config/nvim lazygit   # files, folders and tools
+kit init git@github.com:you/dotfiles.git  # an empty PRIVATE repo, for the backup
+kit sync
 ```
+Then, day to day: edit your files as usual, `kit save` what you want to keep, `kit sync`.
 
-## Everyday
-| | |
-|---|---|
-| `kit status` | what differs between this machine and the repo (`-v` lists every file) |
-| `kit diff [file]` | the details, through [delta](https://github.com/dandavison/delta) (`-r` other direction, `--plain` raw patch) |
-| `kit re-add [file]` | keep this machine's version: copies changed, new and deleted files into the repo |
-| `kit apply [file]` | take the repo's version (plus packages, externals, scripts). `-n` previews |
-| `kit add <file/folder>` | start tracking (new files in tracked folders show up in `status`) |
-| `kit forget <file/folder>` | stop tracking (the file stays) |
-| `kit ignore <file>` | never track it · `--remote`: tracked, but not sent to servers |
-| `kit edit <file>` | edit the repo copy, then apply it |
-| `kit save ["msg"]` | commit + push the repo · `-a` re-adds first |
-| `kit update` | pull what other machines saved, then apply it |
-| `kit undo` / `kit restore` | put back what an apply replaced |
-| `kit cd` / `kit git …` | work in the repo directly |
+## Two machines
+`kit sync` only moves what was **saved**. A change you didn't `kit save` stays on its machine.
+When a sync brings a newer version of a file you also changed here (and didn't save):
+- **different lines** — kit merges them: your file gets both changes. Yours still isn't in the
+  repo; `kit save` and `kit sync` when you're happy.
+- **the same lines** — kit writes both versions into the file between `<<<<<<< this machine` and
+  `>>>>>>> repo`. Keep what you want, delete the markers, then `kit save`. Or `kit undo <file>`
+  takes the repo's version, and `kit undo` puts yours back as it was before the sync.
 
-kit remembers what it last synced on each machine, so `status` can tell "changed here",
-"changed in repo" and "changed on both". `apply` never silently overwrites a file you changed
-here: it asks (or skips it without a terminal); `--force` overwrites, keeping a backup.
+Anything a sync or undo replaces is kept, so `kit undo` can always put it back.
 
-Tab completion (commands, options, tracked files, packages, servers, scripts) installs itself
-for zsh, bash and fish the first time kit runs.
-
-## Packages
-| | |
-|---|---|
-| `kit add pkg <tool>` | install here + track (name, `owner/repo`, or a mise spec like `aqua:owner/repo`) |
-| `kit pkg add <tool> --only linux` | only for Linux machines and servers |
-| `kit pkg list` | what's tracked, installed here, sent to servers |
-| `kit pkg set <tool> --no-servers` | change one (`--bin`, `--fallback`, `--mac`, `--linux`) |
-| `kit pkg rm <tool>` | stop tracking (`--uninstall` also removes it here) |
-| `kit pkg upgrade [tool]` | bump Linux/server versions to the latest release |
-| `kit pkg scan` | installed with brew/cargo but not tracked |
-
-On a Mac packages come from Homebrew, cargo or casks; on Linux and servers from
-[mise](https://mise.jdx.dev) (GitHub releases, no root). `--fallback cargo:<crate>@<ver>` builds
-from source on old systems where no download runs. delta and bat always come with kit.
+## Tools
+`kit add <tool>` looks the tool up once and writes down how to install it:
+on a Mac from Homebrew (`brew:lazygit`), on Linux and servers from the GitHub releases mise knows
+about (`aqua:jesseduffield/lazygit@0.66.0`, version pinned). Every machine then installs it the
+same way. Adding it again pins the newest version. Not found? Give the GitHub repo
+(`kit add owner/repo`) or the recipes: `--mac brew:…|cask:…|cargo:…`, `--linux <mise spec>`;
+`--fallback cargo:<crate>` builds from source on old systems where no download runs.
+delta and bat always come with kit.
 
 ## Servers
-`kit push <host>` installs your tools, zsh, nvim and configs into `~/.local/kit` on a Linux server
-over ssh (no root; works on old glibc). A plain `ssh <host>` then lands in your shell; scp, rsync
-and `ssh host <command>` are unaffected. `kit push --all` updates every server; `kit remote`
-lists them; `kit remote status|off|on|remove <host>`. Only `~/.config/*` and `~/.fizsh/*` travel;
-`[remote]` in `.kitignore` keeps things home.
-
-On your own Linux machine `kit apply` installs the same tools into `~/.local/kit` but uses your
-real `~/.config`; `kit shell install` makes new terminals start that shell.
-
-## Scripts
-`scripts/*.sh` in the repo run after `kit apply`. Headers at the top of the file:
-`# kit: on=mac|linux`, `# kit: run=onchange|once|always`, `# kit: watch=<paths relative to $HOME>`.
-`kit update` asks before running new or changed scripts. `kit scripts` lists them.
+`kit push <host>` installs your tools, zsh, nvim and configs into `~/.local/kit` over ssh (no root;
+old glibc is fine). A plain `ssh <host>` then lands in your shell; scp, rsync and
+`ssh host <command>` are unaffected. `touch ~/.kit-off` there turns it off;
+`kit push <host> --remove` takes it away. Only `~/.config/*` and `~/.fizsh/*` travel;
+`kit add --no-servers` keeps something home.
 
 ## The repo
 - `home/` tracked files, laid out like `$HOME`
-- `packages.json` packages (via `kit pkg`)
+- `packages.json` tools (written by `kit add`)
 - `rules.json` small per-platform edits applied when writing files, e.g.
   `{"path": ".config/zellij/config.kdl", "on": ["linux"], "delete_lines": ["^copy_command "]}`
   (also `replace` and `regex`; `on` can be `mac`, `linux`, `remote`)
 - `externals.json` git checkouts placed into `$HOME`: `{".fizsh/.antidote": {"git": "<url>", "ref": "v2.3.0"}}`
-- `remotes.json` servers you pushed to
-- `.kitignore` gitignore-style patterns; `[remote]` = not sent to servers; `[mac]`/`[linux]` = ignored there; `!pattern` un-ignores
-- per-machine state (sync records, backups) lives in `~/.local/state/kit`, not in git
+- `scripts/*.sh` run by `kit sync`; headers `# kit: on=mac|linux`, `# kit: run=onchange|once|always`,
+  `# kit: watch=<paths>`. New or changed scripts from another machine run only after you agree.
+- `.kitignore` gitignore-style; `[remote]` = not sent to servers; `[mac]`/`[linux]` = ignored there
+- per-machine state (last-synced copies, backups) lives in `~/.local/state/kit`
 
-Secrets are refused (by file name and by content: keys, tokens, passwords) unless you `--force`;
-`kit save` checks again before committing.
+Secrets (keys, tokens, passwords, by name and by content) are refused unless you `--force`.
 
 ## Development
 ```bash
-cargo build && python3 tests/run.py     # 150 black-box tests, each in a sandboxed $HOME
+cargo build && python3 tests/run.py     # black-box tests, each in a sandboxed $HOME
 ```

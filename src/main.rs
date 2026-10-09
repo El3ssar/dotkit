@@ -28,14 +28,33 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use cli::{build_cli, Args};
 use util::*;
 
-const CHEZMOI_HINTS: &[(&str, &str)] = &[
-    ("merge", "kit diff, then kit re-add --force (yours) or kit apply --force (repo's)"),
-    ("chattr", "edit packages or rules in the repo (kit cd)"),
+/// Commands kit doesn't have (older kit's, or chezmoi's), and what to use instead.
+const HINTS: &[(&str, &str)] = &[
+    ("apply", "kit sync (or kit undo <file> to take the repo's version of one file)"),
+    ("update", "kit sync"),
+    ("re-add", "kit save"),
+    ("forget", "kit rm"),
+    ("ignore", "kit rm (inside a tracked folder it also stops it showing up as new)"),
+    ("diff", "kit status <file>"),
+    ("restore", "kit undo"),
+    ("remote", "kit push"),
+    ("pkg", "kit add <tool> / kit rm <tool>"),
+    ("doctor", "kit status"),
+    ("managed", "kit status -v"),
+    ("unmanaged", "kit status"),
+    ("verify", "kit status"),
+    ("edit", "edit the file, then kit save"),
+    ("cd", "the repo is in ~/.local/share/kit"),
+    ("git", "the repo is in ~/.local/share/kit"),
+    ("cat", "kit status <file>"),
+    ("source-path", "the repo is in ~/.local/share/kit"),
+    ("scripts", "scripts run with kit sync; kit status shows the ones waiting"),
+    ("shell", "kit sync sets up the shell environment on Linux"),
+    ("merge", "kit sync merges files changed on both machines"),
+    ("chattr", "edit packages or rules in the repo (~/.local/share/kit)"),
     ("data", "per-platform edits live in rules.json (see README)"),
     ("execute-template", "kit has no templates: rules.json does per-platform edits"),
-    ("ignored", "see .kitignore (kit cd)"),
-    ("purge", "kit forget, then delete the repo folder"),
-    ("archive", "kit git archive"),
+    ("purge", "kit rm, then delete ~/.local/share/kit"),
 ];
 
 /// Edit distance where swapping two neighbouring letters counts as one typo.
@@ -76,7 +95,7 @@ fn usage_error(e: clap::Error, argv: &[String]) -> ! {
                 Some(ContextValue::String(s)) => s.clone(),
                 _ => String::new(),
             };
-            if let Some((_, hint)) = CHEZMOI_HINTS.iter().find(|(n, _)| *n == bad) {
+            if let Some((_, hint)) = HINTS.iter().find(|(n, _)| *n == bad) {
                 die_code(&format!("kit has no '{bad}': {hint}"), 2);
             }
             let parent = build_cli();
@@ -108,48 +127,13 @@ fn dispatch(m: &clap::ArgMatches) {
     match name {
         "init" => files::cmd_init(&a),
         "add" => files::cmd_add(&a),
-        "re-add" => files::cmd_re_add(&a),
-        "forget" => files::cmd_forget(&a),
-        "ignore" => files::cmd_ignore(&a),
-        "managed" => files::cmd_managed(&a),
-        "unmanaged" => files::cmd_unmanaged(&a),
+        "rm" => files::cmd_rm(&a),
         "status" => files::cmd_status(&a),
-        "verify" => files::cmd_verify(&a),
-        "diff" => files::cmd_diff(&a),
-        "apply" => files::cmd_apply(&a),
-        "edit" => files::cmd_edit(&a),
-        "cat" => files::cmd_cat(&a),
-        "source-path" => files::cmd_source_path(&a),
-        "cd" => files::cmd_cd(&a),
-        "git" => files::cmd_git(&a),
         "save" => files::cmd_save(&a),
-        "update" => files::cmd_update(&a),
-        "restore" => files::cmd_restore(&a),
+        "sync" => files::cmd_sync(&a),
         "undo" => files::cmd_undo(&a),
-        "scripts" => scripts::cmd_scripts(&a),
         "push" => remote::cmd_push(&a),
-        "remote" => remote::cmd_remote(&a),
-        "shell" => remote::cmd_shell(&a),
-        "doctor" => remote::cmd_doctor(&a),
         "completion" => complete::cmd_completion(&a),
-        "pkg" => match sub.subcommand() {
-            Some((action, sm)) => {
-                let pa = Args::new(sm.clone());
-                match action {
-                    "add" => pkg::cmd_pkg_add(&pa),
-                    "rm" => pkg::cmd_pkg_rm(&pa),
-                    "set" => pkg::cmd_pkg_set(&pa),
-                    "list" => pkg::cmd_pkg_list(&pa),
-                    "install" => pkg::cmd_pkg_install(&pa),
-                    "upgrade" => pkg::cmd_pkg_upgrade(&pa),
-                    _ => pkg::cmd_pkg_scan(&pa),
-                }
-            }
-            None => {
-                let mut root = build_cli();
-                let _ = root.find_subcommand_mut("pkg").unwrap().print_help();
-            }
-        },
         _ => unreachable!(),
     }
 }
@@ -168,17 +152,15 @@ fn main() {
         }
         return;
     }
-    if argv.len() >= 2 && argv[0] == "add" && argv[1] == "pkg" {
-        argv.splice(0..2, ["pkg".to_string(), "add".to_string()]);
-    } else if argv.len() >= 2 && (argv[0] == "rm" || argv[0] == "forget") && argv[1] == "pkg" {
-        argv.splice(0..2, ["pkg".to_string(), "rm".to_string()]);
+    if argv.len() >= 2 && (argv[0] == "add" || argv[0] == "rm") && argv[1] == "pkg" {
+        argv.remove(1); // older kit: `kit add pkg <tool>`
     }
     if argv.first().map(String::as_str) == Some("help") {
         argv = argv[1..].iter().take(2).cloned().chain(["--help".to_string()]).collect();
     }
     let m = build_cli().try_get_matches_from(std::iter::once("kit".to_string()).chain(argv.iter().cloned())).unwrap_or_else(|e| usage_error(e, &argv));
     let cmd = m.subcommand_name().unwrap_or("");
-    if !cmd.is_empty() && cmd != "init" && cmd != "doctor" && cmd != "completion" && !ctx().source.exists() {
+    if !cmd.is_empty() && cmd != "init" && cmd != "completion" && !ctx().source.exists() {
         die(&format!("no kit repo at {} — run `kit init` (or `kit init <git-url>`)", ctx().source.display()));
     }
     if !cmd.is_empty() {

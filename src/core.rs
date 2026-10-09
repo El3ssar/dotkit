@@ -638,9 +638,9 @@ pub fn load_synced() -> Synced {
     for rel in managed(None) {
         let Ok(src) = source_entry(&rel, &local_contexts()) else { continue };
         let tgt = read_entry(&cx.home.join(&rel));
-        if src.is_some() && same(src.as_ref(), tgt.as_ref()) {
-            if let Some(d) = digest(tgt.as_ref()) {
-                synced.insert(rel, d);
+        if let (Some(_), Some(t)) = (&src, &tgt) {
+            if same(src.as_ref(), Some(t)) {
+                mark_synced(&mut synced, &rel, t);
             }
         }
     }
@@ -650,6 +650,42 @@ pub fn load_synced() -> Synced {
 
 pub fn save_synced(s: &Synced) {
     save_json(&ctx().synced, &serde_json::to_value(s).unwrap());
+}
+
+/// The last-synced copy of each file lives in <state>/base: the common ancestor for merges.
+fn base_path(rel: &str) -> PathBuf {
+    ctx().state.join("base").join(rel)
+}
+
+pub fn get_base(rel: &str) -> Option<Vec<u8>> {
+    fs::read(base_path(rel)).ok()
+}
+
+/// Remember `e` as the version this machine and the repo last agreed on.
+pub fn mark_synced(synced: &mut Synced, rel: &str, e: &Entry) {
+    let Some(d) = digest(Some(e)) else { return };
+    let p = base_path(rel);
+    let fresh = synced.get(rel) != Some(&d) || !exists_or_link(&p);
+    synced.insert(rel.to_string(), d);
+    if !fresh {
+        return;
+    }
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    match e {
+        Entry::File(b, _) => {
+            let _ = write_atomic(&p, b, 0o600);
+        }
+        _ => {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+pub fn unmark_synced(synced: &mut Synced, rel: &str) {
+    synced.remove(rel);
+    let _ = fs::remove_file(base_path(rel));
 }
 
 pub fn tracked_dirs() -> Vec<String> {
@@ -664,7 +700,8 @@ pub fn label(code: &str) -> &'static str {
         "missing" => "missing here",
         "deleted" => "deleted here",
         "new" => "new here",
-        "type" => "conflict",
+        "type" => "file vs folder",
+        "conflict" => "has conflicts",
         _ => "unreadable",
     }
 }
@@ -680,6 +717,7 @@ pub fn classify(rel: &str, synced: &Synced) -> KResult<Option<&'static str>> {
         Some(Entry::Dir) | Some(Entry::Other) => Some("type"),
         Some(Entry::Unreadable) => Some("unreadable"),
         _ if same(src.as_ref(), tgt.as_ref()) => None,
+        Some(Entry::File(b, _)) if has_conflict_markers(b) => Some("conflict"),
         _ => match synced.get(rel) {
             None => Some("both"),
             Some(last) => {
@@ -740,13 +778,16 @@ pub fn refresh_synced(synced: &mut Synced, prefixes: Option<&[String]>) {
     for rel in managed(prefixes) {
         let Ok(src) = source_entry(&rel, &local_contexts()) else { continue };
         let tgt = read_entry(&cx.home.join(&rel));
-        if src.is_some() && same(src.as_ref(), tgt.as_ref()) {
-            if let Some(d) = digest(tgt.as_ref()) {
-                synced.insert(rel, d);
+        if let (Some(_), Some(t)) = (&src, &tgt) {
+            if same(src.as_ref(), Some(t)) {
+                mark_synced(synced, &rel, t);
             }
         }
     }
-    synced.retain(|rel, _| exists_or_link(&cx.tree.join(rel)));
+    let gone: Vec<String> = synced.keys().filter(|rel| !exists_or_link(&cx.tree.join(rel))).cloned().collect();
+    for rel in gone {
+        unmark_synced(synced, &rel);
+    }
     save_synced(synced);
 }
 

@@ -1,7 +1,6 @@
 //! Servers (`kit push`, `kit remote`), the Linux shell environment, and `kit doctor`.
 use crate::cli::Args;
 use crate::core::*;
-use crate::files::remote_url;
 use crate::pkg::{s, split_spec};
 use crate::util::*;
 use serde_json::Value;
@@ -167,17 +166,21 @@ pub fn cmd_push(a: &Args) {
     }
     guard_repo();
     let mut remotes = load_obj(&cx.remotes);
-    let hosts: Vec<String> = if a.flag("all") { remotes.keys().cloned().collect() } else { a.one("host").into_iter().collect() };
+    if a.flag("remove") {
+        let Some(host) = a.one("host") else { die("which server? kit push <host> --remove") };
+        return remove_from(&host);
+    }
+    let hosts: Vec<String> = match a.one("host") {
+        Some(h) => vec![h],
+        None => remotes.keys().cloned().collect(),
+    };
     if hosts.is_empty() {
-        let known: Vec<String> = remotes.keys().cloned().collect();
-        die(&format!(
-            "which server? kit push <host>, or kit push --all for: {}",
-            if known.is_empty() { "(none yet)".into() } else { known.join(", ") }
-        ));
+        say("no servers yet — kit push <host> puts your environment on one");
+        return;
     }
     let pending = file_changes(None, &load_synced()).into_iter().filter(|(c, _)| matches!(*c, "here" | "new" | "deleted" | "both")).count();
     if pending > 0 {
-        warn(&format!("{pending} change(s) on this machine aren't in the repo, so servers get the repo's version (kit re-add first to send yours)"));
+        warn(&format!("{pending} change(s) on this machine aren't in the repo, so servers get the repo's version (kit save first to send yours)"));
     }
     let payload = cx.state.join("payload");
     say("building");
@@ -186,27 +189,13 @@ pub fn cmd_push(a: &Args) {
     if !summary.is_empty() {
         note(&format!("not sent to servers: {summary}"));
     }
-    let dry = a.flag("dry_run");
     for host in &hosts {
-        if !remotes.contains_key(host) && !a.flag("yes") {
+        if !remotes.contains_key(host) {
             out(&format!(
-                "First push to {host}. This will:\n  · install your environment in ~/{REMOTE_KIT} on {host} (about 1–2 GB with nvim's language servers)\n  \
-                 · add a small block to the end of its ~/.bashrc (and the top of ~/.zshrc if zsh is its login\n    shell) so interactive logins start your shell; \
-                 scp, rsync and `ssh {host} <command>` are unaffected\n  undo any time: kit remote remove {host}"
+                "First push to {host}: your environment goes into ~/{REMOTE_KIT} there (about 1–2 GB with nvim's language servers),\n\
+                 and a small block at the end of its ~/.bashrc makes interactive logins start your shell\n\
+                 (scp, rsync and `ssh {host} <command>` are unaffected). Undo any time: kit push {host} --remove"
             ));
-            if dry {
-                continue;
-            }
-            if !cx.interactive {
-                die("first push to a new server: rerun with --yes to confirm");
-            }
-            if ask("Continue? [y/N]") != "y" {
-                continue;
-            }
-        }
-        if dry {
-            say(&format!("{host}: would sync and set up (version {stamp})"));
-            continue;
         }
         say(&format!("syncing to {host}"));
         if ssh(host, &format!("mkdir -p ~/{REMOTE_KIT}/payload"), false).code != 0 {
@@ -239,206 +228,32 @@ pub fn cmd_push(a: &Args) {
     }
 }
 
-fn remote_state(host: &str, verbose: bool) -> Option<Vec<String>> {
-    let mut script = format!("cat ~/{REMOTE_KIT}/.stamp 2>/dev/null || echo none; [ -e ~/.kit-off ] && echo off || echo on");
-    if verbose {
-        script += &format!(
-            "; du -sh ~/{REMOTE_KIT} 2>/dev/null | cut -f1; grep -l '^# >>> kit: ' ~/.bash_profile ~/.bash_login ~/.profile ~/.bashrc ~/.zshrc ~/.fizsh/.zshrc 2>/dev/null | tr '\\n' ' '; echo"
-        );
-    }
-    let r = ssh(host, &script, true);
-    (r.code != 255).then(|| r.stdout.lines().map(String::from).collect())
-}
-
-fn show_remote(host: &str, here: &str, rec: Option<&Value>, verbose: bool) {
-    let when = rec.and_then(|r| r.get("at")).and_then(Value::as_str).filter(|s| !s.is_empty()).map(|a| format!(" (last push {a})")).unwrap_or_default();
-    let Some(st) = remote_state(host, verbose) else {
-        fail(&format!("{host}: unreachable"));
-        return;
-    };
-    match st.first().map(String::as_str) {
-        None | Some("none") => out(&format!("{host}: kit not installed — kit push {host}")),
-        Some(s) if s == here => out(&format!("{host}: up to date{when}")),
-        _ => out(&format!("{host}: out of date{when} — kit push {host}")),
-    }
-    if st.get(1).map(String::as_str) == Some("off") {
-        out(&format!("  logins start the normal shell (kit remote on {host})"));
-    }
-    if verbose && st.len() > 3 {
-        let hook = if st[3].trim().is_empty() { "none" } else { st[3].trim() };
-        out(&format!("  size: {} · login hook in: {hook}", if st[2].is_empty() { "?" } else { &st[2] }));
-    }
-}
-
-pub fn cmd_remote(a: &Args) {
+/// `kit push <host> --remove`: take kit off a server.
+fn remove_from(host: &str) {
     let cx = ctx();
-    let mut remotes = load_obj(&cx.remotes);
-    let action = a.one("action").unwrap_or_else(|| "list".into());
-    let verbose = a.flag("verbose");
-    let Some(h) = a.one("host") else {
-        if action == "list" || action == "status" {
-            if remotes.is_empty() {
-                say("no servers yet — kit push <host>");
-                return;
-            }
-            let here = build_payload(&cx.state.join("payload"), "remote");
-            for (h, rec) in &remotes {
-                show_remote(h, &here, Some(rec), verbose);
-            }
-            return;
-        }
-        die(&format!("which server? kit remote {action} <host>"));
-    };
-    match action.as_str() {
-        "list" | "status" => {
-            let here = build_payload(&cx.state.join("payload"), "remote");
-            show_remote(&h, &here, remotes.get(&h), verbose);
-        }
-        "off" | "on" => {
-            let cmd = if action == "off" { "touch ~/.kit-off" } else { "rm -f ~/.kit-off" };
-            if ssh(&h, cmd, false).code != 0 {
-                fail(&format!("could not reach {h}; nothing changed"));
-            } else if action == "off" {
-                out(&format!("{h}: logins start your normal shell (kit remote on {h} to undo)"));
-            } else {
-                out(&format!("{h}: logins start your kit shell again"));
-            }
-        }
-        _ => {
-            if !a.flag("yes") {
-                if !cx.interactive {
-                    die("add --yes to remove without a terminal");
-                }
-                if ask(&format!("Remove kit from {h} (deletes ~/{REMOTE_KIT} and takes the login hook out)? [y/N]")) != "y" {
-                    return;
-                }
-            }
-            let script = format!(
-                "if [ -f ~/{REMOTE_KIT}/payload/remote/hook.sh ]; then bash ~/{REMOTE_KIT}/payload/remote/hook.sh remove; fi && rm -rf ~/{REMOTE_KIT} ~/.kit-off && echo \"kit removed from $(hostname)\""
-            );
-            if ssh(&h, &script, false).code != 0 {
-                fail(&format!("could not remove kit from {h}"));
-            } else {
-                remotes.remove(&h);
-                save_json(&cx.remotes, &Value::Object(remotes));
-            }
-        }
+    let script = format!(
+        "if [ -f ~/{REMOTE_KIT}/payload/remote/hook.sh ]; then bash ~/{REMOTE_KIT}/payload/remote/hook.sh remove; fi && rm -rf ~/{REMOTE_KIT} ~/.kit-off && echo \"kit removed from $(hostname)\""
+    );
+    if ssh(host, &script, false).code != 0 {
+        fail(&format!("could not remove kit from {host}"));
+        return;
     }
+    let mut remotes = load_obj(&cx.remotes);
+    remotes.remove(host);
+    save_json(&cx.remotes, &Value::Object(remotes));
 }
 
 /// On a Linux machine you use directly: the same tested setup servers get (tools, zsh, nvim) in
-/// ~/.local/kit, but using your real ~/.config and ~/.fizsh. hook=true also makes logins start it.
-pub fn linux_environment(hook: bool) {
+/// ~/.local/kit, but using your real ~/.config and ~/.fizsh.
+pub fn linux_environment() {
     let home = &ctx().home;
     say("setting up tools, zsh and nvim in ~/.local/kit");
     let payload = home.join(REMOTE_KIT).join("payload");
     build_payload(&payload, "local");
-    let env = vec![("KIT_HOOK".to_string(), if hook { "1" } else { "0" }.to_string())];
+    let env = vec![("KIT_HOOK".to_string(), "0".to_string())];
     let setup = path_str(&payload.join("remote/setup.sh"));
     if run_full(&["bash", setup.as_str()], false, None, Some(&env), None).code != 0 {
         fail("environment setup reported problems (see above)");
     }
     crate::complete::install_completions(true); // kit's zsh now exists too
-}
-
-pub fn cmd_shell(a: &Args) {
-    let cx = ctx();
-    if cx.is_mac {
-        say("on a Mac your shell runs directly; `kit shell` is for Linux machines");
-        return;
-    }
-    let off = cx.home.join(".kit-off");
-    match a.one("action").as_deref().unwrap_or("status") {
-        "install" => {
-            out("This installs your tools, zsh and nvim into ~/.local/kit and adds a small block to the end of\n\
-                 ~/.bashrc so new terminals start your shell (a backup of ~/.bashrc is kept). Undo: kit shell remove");
-            if !a.flag("yes") && (!cx.interactive || ask("Continue? [y/N]") != "y") {
-                return;
-            }
-            linux_environment(true);
-        }
-        "off" => {
-            let _ = fs::write(&off, "");
-            say("new terminals start your normal shell (kit shell on to undo)");
-        }
-        "on" => {
-            let _ = fs::remove_file(&off);
-            say("new terminals start your kit shell");
-        }
-        "remove" => {
-            let hook = cx.home.join(REMOTE_KIT).join("payload/remote/hook.sh");
-            if hook.exists() {
-                run(&["bash", &path_str(&hook), "remove"], false);
-            }
-            let _ = fs::remove_dir_all(cx.home.join(REMOTE_KIT));
-            let _ = fs::remove_file(&off);
-            say("removed ~/.local/kit and the login hook");
-        }
-        _ => {
-            let installed = cx.home.join(REMOTE_KIT).join(".stamp").exists();
-            out(&format!(
-                "kit shell: {}{}",
-                if installed { "installed" } else { "not installed (kit shell install)" },
-                if off.exists() { " · off (kit shell on)" } else { "" }
-            ));
-        }
-    }
-}
-
-pub fn cmd_doctor(_a: &Args) {
-    let cx = ctx();
-    let mut ok = true;
-    for (tool, why) in [
-        ("git", "the repo"),
-        ("rsync", "kit push"),
-        ("ssh", "kit push"),
-        ("delta", "kit diff"),
-        ("mise", "packages for Linux and servers"),
-        ("brew", "Mac packages"),
-    ] {
-        if tool == "brew" && !cx.is_mac {
-            continue;
-        }
-        let present = have(tool) || (tool == "delta" && crate::diff::delta_cmd().is_some());
-        ok &= present || tool == "mise";
-        out(&format!("  {tool:6} {}  ({why})", if present { c("32", "ok") } else { c("31", "missing") }));
-    }
-    let is_repo = cx.source.join(".git").exists();
-    out(&format!("  repo   {} {}", cx.source.display(), if is_repo { "(git)".to_string() } else { c("31", "(no git repo: kit init)") }));
-    ok &= is_repo;
-    let url = if is_repo { remote_url() } else { String::new() };
-    out(&format!("  backup {}", if url.is_empty() { c("33", "none yet (kit git remote add origin <url>)") } else { url }));
-    for path in [&cx.pkgs, &cx.rules, &cx.externals, &cx.dirs, &cx.remotes] {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Err(e) = serde_json::from_str::<Value>(&text) {
-                out(&c("31", &format!("  {}: invalid JSON (line {})", path.file_name().unwrap().to_string_lossy(), e.line())));
-                ok = false;
-            }
-        }
-    }
-    for (n, sec, _) in ignore_lines() {
-        if !["all", "remote", "mac", "linux"].contains(&sec.as_str()) {
-            out(&c("33", &format!("  .kitignore line {n}: unknown section [{sec}] (use [remote], [mac] or [linux])")));
-        }
-    }
-    for (f, meta, _) in crate::scripts::script_status() {
-        for e in &meta.errors {
-            out(&c("33", &format!("  scripts/{}: {e}", f.file_name().unwrap().to_string_lossy())));
-            ok = false;
-        }
-    }
-    let hidden = hidden_by_gitignore();
-    if !hidden.is_empty() {
-        out(&c("33", &format!("  {} tracked file(s) hidden from git by a .gitignore in home/ (kit save includes them)", hidden.len())));
-    }
-    if is_repo {
-        if let Some(busy) = repo_busy() {
-            out(&c("31", &format!("  the repo is in the middle of a git {busy}")));
-            ok = false;
-        }
-    }
-    say(if ok { "all good" } else { "problems found (see above)" });
-    if !ok {
-        set_exit(1);
-    }
 }

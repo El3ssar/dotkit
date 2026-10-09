@@ -121,7 +121,3 @@ pub fn show_patch(text: &str, plain: bool, page: bool) {
     }
     out_raw(colorize(text).as_bytes());
 }
-
-pub fn show_diff(rel: &str, old: Option<&Entry>, new: Option<&Entry>, old_label: &str, new_label: &str) {
-    show_patch(&diff_text(rel, old, new, old_label, new_label, ""), false, false);
-}

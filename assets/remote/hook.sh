@@ -6,7 +6,7 @@
 # `ssh -t host bash --norc` for a plain shell.
 set -euo pipefail
 
-BEGIN='# >>> kit: interactive logins start ~/.local/kit (undo: kit remote off|remove <host>, or kit shell off|remove) >>>'
+BEGIN='# >>> kit: interactive logins start ~/.local/kit (off: touch ~/.kit-off · remove: kit push <host> --remove) >>>'
 END='# <<< kit <<<'
 BLOCK="$BEGIN
 if [ -z \"\${KIT_ACTIVE:-}\" ] && case \$- in *i*) true ;; *) false ;; esac \\

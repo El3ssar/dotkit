@@ -1,9 +1,8 @@
-//! scripts/*.sh run after `kit apply`. Header lines (in the comment block at the top):
+//! scripts/*.sh run after `kit update` writes files. Header lines (in the comment block at the top):
 //!   # kit: on=mac               only on this platform (mac|linux)
 //!   # kit: run=onchange         onchange (default): again when the script or a watched path changes
 //!                               once: only the first time · always: every apply
 //!   # kit: watch=<paths>        files/folders (relative to $HOME) whose changes re-run the script
-use crate::cli::Args;
 use crate::core::walk_entries;
 use crate::util::*;
 use serde_json::Value;
@@ -126,7 +125,7 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
     if let Some(names) = names {
         for n in names {
             if !rows.iter().any(|(f, _, _)| &stem(f) == n || &name(f) == n) {
-                fail(&format!("no script called {n} (kit scripts lists them)"));
+                fail(&format!("no script called {n}"));
             }
         }
     }
@@ -153,31 +152,7 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
             done.insert(name(&f), Value::from(script_hash(&f, &meta)));
             save_json(&cx.script_state, &Value::Object(done.clone()));
         } else {
-            fail(&format!("script {} failed; it runs again on the next `kit apply`", name(&f)));
-        }
-    }
-}
-
-pub fn cmd_scripts(a: &Args) {
-    if a.one("action").as_deref() == Some("run") {
-        let names = a.many("names");
-        run_scripts(if names.is_empty() { None } else { Some(&names) }, a.flag("force"), false);
-        return;
-    }
-    let rows = script_status();
-    if rows.is_empty() {
-        out("no scripts (add .sh files to scripts/ in the repo: kit cd)");
-    }
-    for (f, meta, state) in rows {
-        let mark = match state {
-            "done" => c("32", "done    "),
-            "pending" => c("33", "will run"),
-            _ => c("2", "not here"),
-        };
-        let on = meta.on.as_ref().map(|o| format!(" on={o}")).unwrap_or_default();
-        out(&format!("  {:30} {mark}  run={}{on}", name(&f), meta.run));
-        for e in &meta.errors {
-            out(&c("33", &format!("      ! {e}")));
+            fail(&format!("script {} failed; it runs again on the next `kit update`", name(&f)));
         }
     }
 }

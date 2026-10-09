@@ -205,46 +205,62 @@ fn pinned(spec: &str) -> String {
     format!("{base}@{ver}")
 }
 
-pub fn cmd_pkg_add(a: &Args) {
+/// The same recipe at the newest version mise knows (or unchanged when it can't tell).
+fn bumped(spec: &str) -> String {
+    let (base, old) = split_spec(spec);
+    match mise_latest(&base) {
+        Some(v) => format!("{base}@{v}"),
+        None => old.map(|o| format!("{base}@{o}")).unwrap_or_else(|| format!("{base}@latest")),
+    }
+}
+
+/// `kit add <tool>`: work out how to install it on a Mac and on Linux, record it, install it here.
+pub fn add_tools(names: &[String], a: &Args) {
     let mut pkgs = load_pkgs();
     let mut changed = false;
-    let only = a.one("only");
-    for name in a.many("names") {
+    for name in names {
+        let name = name.clone();
         let key = pkg_key(&name);
         let old = pkgs.get(&key).cloned();
         let mut entry = old.clone().unwrap_or_default();
         let kind = name.split_once(':').map(|(k, _)| k.to_string());
-        if matches!(kind.as_deref(), Some("brew" | "cask" | "cargo" | "cargo-git" | "cmd")) && only.as_deref() != Some("linux") {
-            entry.insert("mac".into(), name.clone().into()); // e.g. kit add pkg cask:kitty
+        // how to install it on a Mac
+        if let Some(m) = a.one("mac") {
+            entry.insert("mac".into(), m.into());
+        } else if matches!(kind.as_deref(), Some("brew" | "cask" | "cargo" | "cargo-git" | "cmd")) {
+            entry.insert("mac".into(), name.clone().into()); // e.g. kit add cask:kitty
         }
-        let backend_flag = a.one("backend");
-        if only.as_deref() != Some("mac") && (s(&entry, "linux").is_none() || backend_flag.is_some() || (kind.is_some() && is_mise_spec(&name))) {
-            let mut backend = backend_flag.clone().or_else(|| mise_backend(&name));
-            if let Some(b) = &backend {
-                if !is_mise_spec(b) {
-                    fail(&format!("{b} isn't a Linux recipe (use a mise spec like aqua:owner/repo or github:owner/repo)"));
-                    backend = None;
+        // how to install it on Linux and servers (adding a tracked tool again pins the latest version)
+        {
+            let wanted = a.one("linux").or_else(|| (kind.is_some() && is_mise_spec(&name)).then(|| name.clone()));
+            match wanted {
+                Some(spec) if is_mise_spec(&spec) => {
+                    entry.insert("linux".into(), pinned(&spec).into());
+                }
+                Some(spec) => fail(&format!("{spec} isn't a Linux recipe (use a mise spec like aqua:owner/repo or github:owner/repo)")),
+                None => match s(&entry, "linux").map(String::from) {
+                    Some(cur) => {
+                        entry.insert("linux".into(), bumped(&cur).into());
+                    }
+                    None => {
+                        if let Some(b) = mise_backend(&name) {
+                            entry.insert("linux".into(), pinned(&b).into());
+                        }
+                    }
+                },
+            }
+            if a.one("fallback").is_none() {
+                if let Some(fb) = s(&entry, "linux_fallback").map(String::from) {
+                    if old.is_some() {
+                        entry.insert("linux_fallback".into(), bumped(&fb).into());
+                    }
                 }
             }
-            if let Some(b) = backend {
-                entry.insert("linux".into(), pinned(&b).into());
-            }
         }
-        if only.as_deref() != Some("linux") && s(&entry, "mac").is_none() {
+        if s(&entry, "mac").is_none() {
             let mac = brew_formula(&name).or_else(|| s(&entry, "linux").map(|l| format!("mise:{l}")));
             if let Some(m) = mac {
                 entry.insert("mac".into(), m.into());
-            }
-        }
-        if old.is_none() {
-            match only.as_deref() {
-                Some("mac") => {
-                    entry.remove("linux");
-                }
-                Some("linux") => {
-                    entry.remove("mac");
-                }
-                _ => {}
             }
         }
         if let Some(b) = a.one("bin") {
@@ -265,11 +281,11 @@ pub fn cmd_pkg_add(a: &Args) {
         }
         entry.retain(|_, v| !v.is_null() && v.as_str() != Some(""));
         if s(&entry, "mac").is_none() && s(&entry, "linux").is_none() {
-            fail(&format!("{name}: not found in Homebrew or mise — give the GitHub repo (owner/repo) or --backend <mise spec>"));
+            fail(&format!("{name}: not a file here, and not a tool Homebrew or mise knows — for a tool give its GitHub repo (owner/repo) or --mac/--linux"));
             continue;
         }
         if Some(&entry) == old.as_ref() {
-            out(&format!("  already tracked: {}", describe(&key, &entry)));
+            out(&format!("  already tracked, nothing new: {}", describe(&key, &entry)));
         } else {
             pkgs.insert(key.clone(), entry.clone());
             save_pkgs(&pkgs);
@@ -281,77 +297,29 @@ pub fn cmd_pkg_add(a: &Args) {
         }
     }
     if changed {
-        say("`kit save` to back up · `kit push <host>` (or --all) to send to servers");
+        say("kit sync to back it up · kit push to put it on your servers");
     }
 }
 
-pub fn cmd_pkg_rm(a: &Args) {
+/// `kit rm <tool>`: stop tracking it (it stays installed here).
+pub fn rm_tools(names: &[String]) {
     let mut pkgs = load_pkgs();
-    for name in a.many("names") {
-        let key = pkg_key(&name);
-        let Some(p) = pkgs.remove(&key) else {
-            fail(&format!("{name} is not a tracked package (kit pkg list)"));
-            continue;
-        };
-        say(&format!("{key} is no longer tracked"));
-        if a.flag("uninstall") {
-            let spec = pkg_spec(&p).unwrap_or("").to_string();
-            let (kind, what) = spec.split_once(':').unwrap_or((&spec, ""));
-            let cmd: Option<Vec<String>> = match kind {
-                "brew" => Some(vec!["brew".into(), "uninstall".into(), what.into()]),
-                "cask" => Some(vec!["brew".into(), "uninstall".into(), "--cask".into(), what.into()]),
-                "cargo" => Some(vec!["cargo".into(), "uninstall".into(), what.into()]),
-                "cmd" | "cargo-git" | "" => None,
-                "mise" => Some(vec!["mise".into(), "uninstall".into(), split_spec(what).0]),
-                _ => Some(vec!["mise".into(), "uninstall".into(), split_spec(&spec).0]),
-            };
-            match cmd {
-                Some(c) if run(&c, false).code == 0 => note("uninstalled here; servers drop it on the next kit push"),
-                Some(_) => fail(&format!("could not uninstall {key} here")),
-                None => {}
-            }
+    for name in names {
+        let key = pkg_key(name);
+        if pkgs.remove(&key).is_some() {
+            say(&format!("{key} is no longer tracked (still installed here; servers drop it on the next kit push)"));
         } else {
-            note("still installed here (kit pkg rm --uninstall removes it); servers drop it on the next kit push");
+            fail(&format!("{name} is not tracked"));
         }
     }
     save_pkgs(&pkgs);
 }
 
-pub fn cmd_pkg_set(a: &Args) {
-    let mut pkgs = load_pkgs();
-    let name = a.one("name").unwrap_or_default();
-    let key = pkg_key(&name);
-    let Some(p) = pkgs.get_mut(&key) else { die(&format!("{name} is not a tracked package (kit pkg list)")) };
-    if a.flag("no_servers") {
-        p.insert("remote".into(), false.into());
-    }
-    if a.flag("servers") {
-        p.remove("remote");
-    }
-    if let Some(b) = a.one("bin") {
-        p.insert("bin".into(), b.into());
-    }
-    if let Some(fb) = a.one("fallback") {
-        p.insert("linux_fallback".into(), pinned(&fb).into());
-    }
-    if let Some(m) = a.one("mac") {
-        p.insert("mac".into(), m.into());
-    }
-    if let Some(l) = a.one("linux") {
-        if !is_mise_spec(&l) {
-            die(&format!("--linux {l}: use a mise spec, e.g. aqua:owner/repo@1.2.3"));
-        }
-        p.insert("linux".into(), pinned(&l).into());
-    }
-    let shown = describe(&key, p);
-    save_pkgs(&pkgs);
-    out(&format!("  {shown}"));
-}
-
-pub fn cmd_pkg_list(_a: &Args) {
+/// The table of tracked tools (kit status -v).
+pub fn print_tools() {
     let pkgs = all_packages();
     let w = pkgs.keys().map(|n| n.chars().count()).max().unwrap_or(4).max(4);
-    out(&format!("{:w$}  {:4}  {:7}  {:28}  linux (fallback)", "name", "here", "servers", "mac"));
+    out(&format!("Tools:\n  {:w$}  {:4}  {:7}  {:28}  linux (fallback)", "name", "here", "servers", "mac"));
     for (n, p) in &pkgs {
         let here = if pkg_spec(p).is_some() {
             if pkg_installed(n, p) { "yes ".to_string() } else { c("33", "no  ") }
@@ -364,93 +332,8 @@ pub fn cmd_pkg_list(_a: &Args) {
             mac = mac.chars().take(27).collect::<String>() + "…";
         }
         let fb = s(p, "linux_fallback").map(|f| format!("  ({f})")).unwrap_or_default();
-        out(&format!("{n:w$}  {here}  {srv:7}  {mac:28}  {}{fb}", s(p, "linux").unwrap_or("-")));
+        out(&format!("  {n:w$}  {here}  {srv:7}  {mac:28}  {}{fb}", s(p, "linux").unwrap_or("-")));
     }
-    note(&format!("here: installed on this machine ('-' = no recipe for {}) · servers: installed by kit push", ctx().platform));
+    note(&format!("  here: installed on this machine ('-' = no recipe for {}) · servers: installed by kit push", ctx().platform));
 }
 
-pub fn cmd_pkg_install(_a: &Args) {
-    install_packages();
-    if exit_code() == 0 {
-        say("tracked packages are installed");
-    }
-}
-
-pub fn cmd_pkg_upgrade(a: &Args) {
-    let mut pkgs = load_pkgs();
-    let keys: Vec<String> = a.many("names").iter().map(|n| pkg_key(n)).collect();
-    for k in &keys {
-        if !pkgs.contains_key(k) {
-            fail(&format!("{k} is not a tracked package"));
-        }
-    }
-    if !have("mise") {
-        die("kit pkg upgrade asks mise for the latest versions; install mise first");
-    }
-    let mut bumped = Vec::new();
-    for (n, p) in pkgs.iter_mut() {
-        if !keys.is_empty() && !keys.contains(n) {
-            continue;
-        }
-        for field in ["linux", "linux_fallback"] {
-            let Some(spec) = s(p, field).map(String::from) else { continue };
-            let (base, old) = split_spec(&spec);
-            if let Some(ver) = mise_latest(&base) {
-                if Some(&ver) != old.as_ref() {
-                    p.insert(field.into(), format!("{base}@{ver}").into());
-                    let tag = if field == "linux" { "" } else { " (fallback)" };
-                    bumped.push(format!("{n}{tag}: {} → {ver}", old.unwrap_or_else(|| "?".into())));
-                }
-            }
-        }
-    }
-    save_pkgs(&pkgs);
-    for b in &bumped {
-        out(&format!("  {b}"));
-    }
-    if !bumped.is_empty() {
-        let hosts: Vec<String> = load_obj(&ctx().remotes).keys().cloned().collect();
-        let list = if hosts.is_empty() { String::new() } else { format!(" ({})", hosts.join(", ")) };
-        say(&format!("server versions bumped — roll out: kit push --all{list}"));
-    } else if exit_code() == 0 {
-        say("already on the latest versions");
-    }
-}
-
-pub fn cmd_pkg_scan(_a: &Args) {
-    let pkgs = load_pkgs();
-    let specs: Vec<String> = pkgs.values().filter_map(|p| s(p, "mac").map(String::from)).collect();
-    let mut found: Vec<(&str, String)> = Vec::new();
-    if have("brew") {
-        for name in run(&["brew", "leaves", "--installed-on-request"], true).stdout.split_whitespace() {
-            if !specs.contains(&format!("brew:{name}")) && !pkgs.contains_key(&pkg_key(name)) {
-                found.push(("brew", name.into()));
-            }
-        }
-        for name in run(&["brew", "list", "--cask"], true).stdout.split_whitespace() {
-            if !specs.contains(&format!("cask:{name}")) && !pkgs.contains_key(name) {
-                found.push(("cask", name.into()));
-            }
-        }
-    }
-    if have("cargo") {
-        let re = Regex::new(r"^(\S+) v").unwrap();
-        for line in run(&["cargo", "install", "--list"], true).stdout.lines() {
-            if let Some(m) = re.captures(line) {
-                let n = m[1].to_string();
-                if !specs.contains(&format!("cargo:{n}")) && !pkgs.contains_key(&n) {
-                    found.push(("cargo", n));
-                }
-            }
-        }
-    }
-    if found.is_empty() {
-        say("everything installed with brew/cargo is tracked");
-        return;
-    }
-    out("Installed here but not tracked by kit:");
-    for (kind, name) in found {
-        let arg = if kind == "brew" { name.clone() } else { format!("{kind}:{name}") };
-        out(&format!("  {kind:6} {name:24} → kit add pkg {arg}"));
-    }
-}

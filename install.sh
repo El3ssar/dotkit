@@ -56,8 +56,8 @@ esac
 if [ $# -gt 0 ]; then
   say "setting this machine up from $1"
   "$BIN_DIR/kit" init "$1"
-  "$BIN_DIR/kit" apply </dev/tty || "$BIN_DIR/kit" apply
+  "$BIN_DIR/kit" sync </dev/tty || "$BIN_DIR/kit" sync
   say "done — open a new terminal"
 else
-  say "next: kit init <your-kit-repo-url> && kit apply   (or kit init to start a new repo)"
+  say "next: kit init <your-kit-repo-url> && kit sync   (or kit init to start a new repo)"
 fi

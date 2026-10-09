@@ -502,8 +502,23 @@ pub fn glob_escape(s: &str) -> String {
     out
 }
 
+/// A new, unused backup name (time to the millisecond; never reused even within one).
 pub fn now_stamp() -> String {
-    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+    let base = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f").to_string();
+    let backups = &ctx().backups;
+    let mut stamp = base.clone();
+    let mut n = 1;
+    while backups.join(&stamp).exists() || backups.join(format!("{stamp}-undo")).exists() {
+        stamp = format!("{base}{n}");
+        n += 1;
+    }
+    let _ = std::fs::create_dir_all(backups.join(&stamp)); // reserve it
+    stamp
+}
+
+/// Drop a reserved backup folder that ended up empty.
+pub fn release_stamp(stamp: &str) {
+    let _ = std::fs::remove_dir(ctx().backups.join(stamp));
 }
 
 pub fn hostname() -> String {

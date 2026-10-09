@@ -222,30 +222,19 @@ pub fn complete(words: &[String]) -> Vec<String> {
     let cmdpath: Vec<&str> = path.iter().map(String::as_str).collect();
     let cx = ctx();
     match id {
-        "paths" | "path" | "args" => {
-            if FILE_ARGS.contains(&cmdpath.as_slice()) {
-                vec!["__files__".into()]
-            } else {
-                tracked_paths(&cur)
+        "paths" => {
+            let mut v = if FILE_ARGS.contains(&cmdpath.as_slice()) { vec!["__files__".to_string()] } else { tracked_paths(&cur) };
+            if cmdpath == ["rm"] && !cur.contains('/') && !cur.starts_with('~') {
+                v.extend(crate::pkg::load_pkgs().keys().map(|n| format!("{n}\ttool")));
             }
-        }
-        "host" => ssh_hosts(),
-        "stamp" => {
-            let mut v: Vec<String> = fs::read_dir(&cx.backups).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
-            v.sort();
+            if cmdpath == ["undo"] && !cur.contains('/') && !cur.starts_with('~') {
+                let mut stamps: Vec<String> = fs::read_dir(&cx.backups).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+                stamps.sort();
+                v.extend(stamps.into_iter().rev().take(10).map(|s| format!("{s}\tbackup")));
+            }
             v
         }
-        "names" | "name" => match cmdpath.as_slice() {
-            ["scripts"] => crate::scripts::script_status().iter().map(|(f, _, _)| f.file_stem().unwrap().to_string_lossy().into_owned()).collect(),
-            ["pkg", "rm"] | ["pkg", "set"] | ["pkg", "upgrade"] => crate::pkg::load_pkgs()
-                .iter()
-                .map(|(n, p)| {
-                    let spec: String = crate::pkg::s(p, cx.platform).or(crate::pkg::s(p, "linux")).unwrap_or("").chars().take(40).collect();
-                    format!("{n}\t{spec}")
-                })
-                .collect(),
-            _ => vec![],
-        },
+        "host" => ssh_hosts(),
         _ => vec![],
     }
 }
