@@ -2,7 +2,7 @@
 # Install kit (dotkit) and, optionally, set this machine up from your kit repo:
 #   curl -fsSL https://raw.githubusercontent.com/El3ssar/dotkit/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/El3ssar/dotkit/main/install.sh | sh -s -- <your-kit-repo-url>
-# Puts a prebuilt `kit` in ~/.local/bin (no Rust needed). Set KIT_VERSION=v3.0.0 to pin a release.
+# Puts a prebuilt `kit` in ~/.local/bin (no Rust needed). Set KIT_VERSION=v0.1.0 to pin a release.
 set -eu
 REPO="El3ssar/dotkit"
 BIN_DIR="${KIT_BIN_DIR:-$HOME/.local/bin}"
