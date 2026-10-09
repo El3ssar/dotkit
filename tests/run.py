@@ -322,6 +322,11 @@ esac
 """
 
 
+# mise that installs fine but knows no versions (on Linux, `kit pkg add` really installs with mise)
+MISE_USE_OK = """case "$1" in use|uninstall|install) exit 0;; *) exit 1;; esac
+"""
+
+
 # =========================================================================== init
 @test
 def init_creates_repo(sb):
@@ -1534,7 +1539,7 @@ def pkg_add_fallback(sb):
     sb.stub("mise", script=MISE_STUB)
     m.kit("pkg", "add", "--only", "linux", "--fallback", "cargo:foo", "aqua:o/foo@1.0")
     ok(pkgs(m)["foo"] == {"linux": "aqua:o/foo@1.0", "linux_fallback": "cargo:foo@1.2.3"}, pkgs(m)["foo"])
-    sb.stub("mise", script="exit 1\n")
+    sb.stub("mise", script=MISE_USE_OK)
     m.kit("pkg", "add", "--only", "linux", "--fallback", "cargo:bar", "aqua:o/bar@2.0")
     ok(pkgs(m)["bar"]["linux_fallback"] == "cargo:bar@latest", pkgs(m)["bar"])
     m.kit("pkg", "add", "--only", "linux", "--fallback", "cargo:baz@0.9", "aqua:o/baz@3.0")
@@ -1545,6 +1550,7 @@ def pkg_add_fallback(sb):
 @test
 def pkg_add_no_servers(sb):
     m = setup(sb)
+    sb.stub("mise", script=MISE_USE_OK)
     m.kit("pkg", "add", "--only", "linux", "--no-servers", "aqua:o/tool@1.0")
     ok(pkgs(m)["tool"]["remote"] is False)
     out = m.kit("pkg", "list").out
@@ -1557,6 +1563,7 @@ def pkg_add_no_servers(sb):
 @test
 def pkg_split_keeps_npm_scope(sb):
     m = setup(sb)
+    sb.stub("mise", script=MISE_USE_OK)
     m.kit("pkg", "add", "--only", "linux", "npm:@scope/pkg@1.2.3")
     ok(pkgs(m)["pkg"]["linux"] == "npm:@scope/pkg@1.2.3", pkgs(m))
     m.kit("pkg", "add", "--only", "linux", "npm:@other/cli")    # mise fails → @latest
@@ -1566,6 +1573,7 @@ def pkg_split_keeps_npm_scope(sb):
 @test
 def pkg_add_already_tracked(sb):
     m = setup(sb)
+    sb.stub("mise", script=MISE_USE_OK)
     m.kit("pkg", "add", "--only", "linux", "aqua:o/tool@1.0")
     has(m.kit("pkg", "add", "--only", "linux", "aqua:o/tool@1.0").out, "already tracked")
 
@@ -1586,6 +1594,7 @@ def pkg_rm(sb):
 @test
 def pkg_rm_uninstall(sb):
     m = setup(sb)
+    sb.stub("mise", script=MISE_USE_OK)
     sb.stub("brew", code=0)
     (m.src / "packages.json").write_text(json.dumps({"foo": {"mac": "brew:foo", "linux": "aqua:o/foo@1"}}))
     m.kit("pkg", "rm", "--uninstall", "foo")
