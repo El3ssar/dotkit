@@ -37,6 +37,7 @@ jobs:
           shasum -a 256 kit-${{ matrix.target }}.tar.gz > kit-${{ matrix.target }}.tar.gz.sha256
       - uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             kit-${{ matrix.target }}.tar.gz
             kit-${{ matrix.target }}.tar.gz.sha256
