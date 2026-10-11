@@ -315,7 +315,7 @@ pub fn cmd_completion(a: &Args) {
     match a.one("shell").as_deref().unwrap_or("install") {
         "install" => {
             for f in install_completions(false) {
-                out(&format!("  {}", f.display()));
+                out(&format!("  {}", tilde(&f)));
             }
             say("completion installed — open a new shell (zsh: or run `compinit`)");
         }

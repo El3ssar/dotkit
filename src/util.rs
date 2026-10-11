@@ -384,6 +384,15 @@ pub fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// A path for messages: ~/… when it's inside $HOME.
+pub fn tilde(p: &Path) -> String {
+    match p.strip_prefix(&ctx().home) {
+        Ok(r) if r.as_os_str().is_empty() => "~".into(),
+        Ok(r) => format!("~/{}", r.display()),
+        Err(_) => p.display().to_string(),
+    }
+}
+
 pub fn rel_to(p: &Path, base: &Path) -> Option<String> {
     p.strip_prefix(base).ok().map(path_str)
 }

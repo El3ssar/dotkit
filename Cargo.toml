@@ -1,13 +1,14 @@
 [package]
 name = "dotkit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
-description = "Your dotfiles, packages and shell on every machine: a chezmoi-style dotfile manager with packages and ssh servers built in"
+description = "Your dotfiles and tools, the same on every machine: track them in git, sync and merge between machines, and put your shell on servers over ssh"
 license = "MIT"
 repository = "https://github.com/El3ssar/dotkit"
+homepage = "https://github.com/El3ssar/dotkit"
 readme = "README.md"
-keywords = ["dotfiles", "chezmoi", "cli", "ssh", "shell"]
+keywords = ["dotfiles", "sync", "config", "ssh", "cli"]
 categories = ["command-line-utilities", "config"]
 include = ["src/**", "assets/**", "Cargo.toml", "README.md", "LICENSE"]
 

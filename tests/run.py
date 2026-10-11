@@ -571,14 +571,6 @@ def add_no_servers_writes_remote_section(sb):
 
 
 @test
-def add_mentions_what_travels_to_servers(sb):
-    m = setup(sb, {".zshrc": "x\n", ".config/a/b": "x\n"})
-    has(m.kit("add", "~/.zshrc").out, "travel to servers")
-    hasnt(m.kit("add", "~/.config/a").out, "travel to servers")
-
-
-# =========================================================================== add: path or tool?
-@test
 def add_bare_name_that_exists_is_a_file(sb):
     m = setup(sb, {"work/bat": "a file called bat\n", "notes.conf": "n\n"})
     sb.stub("mise", script=MISE_STUB)

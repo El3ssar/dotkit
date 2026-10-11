@@ -22,12 +22,12 @@ pub fn cmd_init(a: &Args) {
                 }
                 say(&format!("backup: {u} — kit sync to back up"));
             }
-            None => say(&format!("kit repo already at {} — kit init <url> sets where it's backed up", cx.source.display())),
+            None => say(&format!("kit repo already at {} — kit init <url> sets where it's backed up", tilde(&cx.source))),
         }
         return;
     }
     if let Some(repo) = url {
-        run_check(&["git", "clone", &repo, &path_str(&cx.source)], false);
+        run_check(&["git", "clone", "-q", &repo, &path_str(&cx.source)], false);
         say(&format!("cloned {repo} — kit status to see what it would change here, kit sync to set this machine up"));
         return;
     }
@@ -52,7 +52,7 @@ pub fn cmd_init(a: &Args) {
         }
     }
     let _ = fs::create_dir_all(&cx.scripts);
-    say(&format!("new kit repo at {}", cx.source.display()));
+    say(&format!("new kit repo at {}", tilde(&cx.source)));
     note("next: kit add ~/.zshrc ~/.config/nvim … · make an empty PRIVATE repo on GitHub · kit init <its url> · kit sync");
 }
 
@@ -180,8 +180,6 @@ fn add_files(paths: &[String], force: bool, no_servers: bool) {
     if no_servers && !tops.is_empty() {
         add_ignore(&tops, "remote", "");
         note("kept off servers ([remote] in .kitignore)");
-    } else if tops.iter().any(|t| !t.starts_with(".config/") && !t.starts_with(".fizsh/")) {
-        note("only ~/.config/… and ~/.fizsh/… travel to servers; other files are backed up and restored on your machines");
     }
     if !tops.is_empty() {
         say(&format!("tracking {count} file(s){}", if count > 0 { " — kit sync to back them up" } else { "" }));
@@ -661,12 +659,12 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         warn(&format!("~/{rel} {why} — kit status ~/{rel} compares them, kit undo ~/{rel} takes the repo's, kit save --force ~/{rel} keeps this one"));
     }
     if !conflicts.is_empty() {
-        warn(&format!("{} file(s) changed in the same place on both machines:", conflicts.len()));
+        warn("both machines changed the same lines in:");
         for rel in &conflicts {
             err_line(&format!("    ~/{rel}"));
         }
-        err_line(&c("2", "    open each one and keep what you want between <<<<<<< this machine and >>>>>>> repo, then kit save"));
-        err_line(&c("2", "    or: kit undo <file> takes the repo's version · kit undo puts back yours as it was before this sync"));
+        err_line(&c("2", "    keep what you want between <<<<<<< and >>>>>>>, then kit save"));
+        err_line(&c("2", "    or: kit undo <file> takes the repo's · kit undo goes back to yours"));
         set_exit(1);
     }
     written
@@ -693,7 +691,7 @@ fn apply_all(run_new_scripts: bool) {
 
 // --------------------------------------------------------------------------- sync
 pub fn remote_url() -> String {
-    let r = git(&["remote", "get-url", "origin"]);
+    let r = git(&["config", "--get", "remote.origin.url"]); // as you typed it (no url rewrites)
     if r.code == 0 {
         r.stdout.trim().to_string()
     } else {

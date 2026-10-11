@@ -127,7 +127,7 @@ fn main() {
     let m = build_cli().try_get_matches_from(std::iter::once("kit".to_string()).chain(argv.iter().cloned())).unwrap_or_else(|e| usage_error(e, &argv));
     let cmd = m.subcommand_name().unwrap_or("");
     if !cmd.is_empty() && cmd != "init" && cmd != "completion" && !ctx().source.exists() {
-        die(&format!("no kit repo at {} — run `kit init` (or `kit init <git-url>`)", ctx().source.display()));
+        die(&format!("no kit repo at {} — run `kit init` (or `kit init <git-url>`)", tilde(&ctx().source)));
     }
     if !cmd.is_empty() {
         files::migrate_state();
