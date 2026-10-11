@@ -164,13 +164,16 @@ mise_sync() {
   MISE_YES=1 "$KIT/bin/mise" install </dev/null >>"$KIT/state/kit-mise.log" 2>&1 || true
   "$KIT/bin/mise" reshim >/dev/null 2>&1 || true
 }
-musl_asset() {  # owner/repo version -> name of a musl release asset for this arch
-  local json="" tag
+musl_asset() {
+  # the release page lists the files without the API's 60-calls-an-hour limit; the API is the backup
+  local names="" tag
   for tag in "v$2" "$2"; do
-    json=$(curl -fsSL --connect-timeout 15 </dev/null "https://api.github.com/repos/$1/releases/tags/$tag" 2>/dev/null) && break
+    names=$(curl -fsSL --connect-timeout 15 </dev/null "https://github.com/$1/releases/expanded_assets/$tag" 2>/dev/null \
+      | grep -oE '/releases/download/[^"]+' | sed 's#.*/##') && [ -n "$names" ] && break
+    names=$(curl -fsSL --connect-timeout 15 </dev/null "https://api.github.com/repos/$1/releases/tags/$tag" 2>/dev/null \
+      | grep -oE '"name": *"[^"]+"' | sed 's/.*"\([^"]*\)"$/\1/') && [ -n "$names" ] && break
   done
-  printf '%s' "$json" | grep -oE '"name": *"[^"]+"' | sed 's/.*"\([^"]*\)"$/\1/' \
-    | grep -iE "musl" | grep -iE "$ARCH_RE" | grep -E "\.(tar\.gz|tar\.xz|tgz|zip)$" | head -1 || true
+  printf '%s\n' "$names" | grep -iE "musl" | grep -iE "$ARCH_RE" | grep -E "\.(tar\.gz|tar\.xz|tgz|zip)$" | head -1 || true
 }
 
 apply_swaps
