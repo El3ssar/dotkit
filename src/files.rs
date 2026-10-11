@@ -53,7 +53,7 @@ pub fn cmd_init(a: &Args) {
     }
     let _ = fs::create_dir_all(&cx.scripts);
     say(&format!("new kit repo at {}", tilde(&cx.source)));
-    note("next: kit add ~/.zshrc ~/.config/nvim … · make an empty PRIVATE repo on GitHub · kit init <its url> · kit sync");
+    note("next: kit add <files or tools>, then kit init <url of an empty private repo>");
 }
 
 // --------------------------------------------------------------------------- add / rm

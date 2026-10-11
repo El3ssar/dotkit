@@ -22,10 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/El3ssar/dotkit/main/install.sh | sh
 
 ## Start
 
+Make an empty, private repo on GitHub for the backup, then:
+
 ```bash
-kit init                                   # a new repo in ~/.local/share/kit
-kit add ~/.zshrc ~/.config/nvim lazygit    # files, folders and tools
-kit init git@github.com:you/dotfiles.git   # an empty, private repo for the backup
+kit init                       # a new repo
+kit add ~/.zshrc lazygit       # files, folders and tools
+kit init git@github.com:you/dotfiles.git
 kit sync
 ```
 
@@ -48,10 +50,12 @@ kit sync
 Edit your files as usual, then:
 
 ```bash
-kit status        # what changed (kit status ~/.zshrc shows the diff)
-kit save          # keep this machine's changes
-kit sync          # back them up, and get what your other machines saved
+kit status       # what changed
+kit save         # keep this machine's changes
+kit sync         # back up, get the others'
 ```
+
+`kit status ~/.zshrc` shows the diff.
 
 Only what you `save` leaves the machine. A sync never overwrites a file you changed and didn't
 save: it merges instead.

@@ -203,8 +203,10 @@ fn describe(name: &str, p: &Pkg) -> String {
     if let Some(fb) = s(p, "linux_fallback") {
         parts.push(format!("fallback: {fb}"));
     }
-    parts.push(format!("servers: {}", if sends_to_servers(p) { "yes" } else { "no" }));
-    format!("{name}  {}", parts.join(" · "))
+    if !sends_to_servers(p) {
+        parts.push("not on servers".into());
+    }
+    format!("{name} — {}", parts.join(" · "))
 }
 
 fn pinned(spec: &str) -> String {
@@ -298,14 +300,14 @@ pub fn add_tools(names: &[String], a: &Args) {
             pkgs.insert(key.clone(), entry.clone());
             save_pkgs(&pkgs);
             changed = true;
-            out(&format!("  {}: {}", if old.is_some() { "updated" } else { "added" }, describe(&key, &entry)));
+            out(&format!("  {} {}", if old.is_some() { "updated" } else { "added" }, describe(&key, &entry)));
         }
         if pkg_spec(&entry).is_some() && !pkg_installed(&key, &entry) {
             install_package(&key, &entry);
         }
     }
     if changed {
-        say("kit sync to back it up · kit push to put it on your servers");
+        say("kit sync to back it up");
     }
 }
 
