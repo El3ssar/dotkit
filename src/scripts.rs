@@ -1,4 +1,4 @@
-//! scripts/*.sh run after `kit update` writes files. Header lines (in the comment block at the top):
+//! scripts/*.sh run after `kit sync` writes files. Header lines (in the comment block at the top):
 //!   # kit: on=mac               only on this platform (mac|linux)
 //!   # kit: run=onchange         onchange (default): again when the script or a watched path changes
 //!                               once: only the first time · always: every apply
@@ -148,11 +148,18 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
         say(&format!("running script {}", name(&f)));
         let env = vec![("KIT_SOURCE".to_string(), path_str(&cx.source))];
         let fstr = path_str(&f);
-        if run_full(&["bash", fstr.as_str()], false, Some(&cx.home), Some(&env), None).code == 0 {
+        // on Linux, scripts get the kit's tools (bat, delta, …) the same way your kit shell does
+        let kit_env = cx.home.join(REMOTE_KIT).join("bin/kit-env");
+        let cmd: Vec<String> = if !cx.is_mac && kit_env.is_file() {
+            vec!["bash".into(), "-c".into(), ". \"$1\" && exec bash \"$2\"".into(), "kit".into(), path_str(&kit_env), fstr.clone()]
+        } else {
+            vec!["bash".into(), fstr.clone()]
+        };
+        if run_full(&cmd, false, Some(&cx.home), Some(&env), None).code == 0 {
             done.insert(name(&f), Value::from(script_hash(&f, &meta)));
             save_json(&cx.script_state, &Value::Object(done.clone()));
         } else {
-            fail(&format!("script {} failed; it runs again on the next `kit update`", name(&f)));
+            fail(&format!("script {} failed; it runs again on the next `kit sync`", name(&f)));
         }
     }
 }

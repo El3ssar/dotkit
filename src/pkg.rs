@@ -104,7 +104,15 @@ pub fn pkg_installed(name: &str, p: &Pkg) -> bool {
     if kind == "brew" && prefix.is_some_and(|pre| pre.join("Cellar").join(what).is_dir()) {
         return true;
     }
-    have(s(p, "bin").unwrap_or(name))
+    let bin = s(p, "bin").unwrap_or(name);
+    if !ctx().is_mac {
+        // on Linux, tools live in ~/.local/kit (on PATH inside your kit shell, not necessarily here)
+        let kit = ctx().home.join(REMOTE_KIT);
+        if ["mise/shims", "bin", "opt/nvim/bin", "opt/zsh/bin"].iter().any(|d| is_executable(&kit.join(d).join(bin))) {
+            return true;
+        }
+    }
+    have(bin)
 }
 
 pub fn install_package(name: &str, p: &Pkg) -> bool {

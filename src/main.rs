@@ -7,7 +7,7 @@
 //!   packages.json   tracked packages (managed by `kit pkg ...`)
 //!   rules.json      small per-platform edits (e.g. drop pbcopy on Linux)
 //!   externals.json  git checkouts placed into $HOME (e.g. antidote)
-//!   scripts/        run after `kit apply` (like chezmoi's run_onchange_ scripts)
+//!   scripts/        run by `kit sync`
 //!   remotes.json    servers you pushed to (managed by `kit push`)
 //!   dirs.json       folders added whole: new files in them show up in `kit status`
 //!   .kitignore      never tracked; [remote]/[mac]/[linux] sections

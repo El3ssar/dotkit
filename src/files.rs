@@ -655,9 +655,10 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         let why = match *code {
             "conflict" => "still has conflict markers from an earlier merge; fix them, then kit save",
             "type" => "is a folder on one side and a file on the other; kit rm it, then kit add it again",
-            _ => "changed on both, and kit can't merge it (binary, or no common version); kit status ~/… to compare, kit save --force keeps yours, kit undo takes the repo's",
+            _ if get_base(rel).is_none() => "already exists here and differs from the repo, so kit left it alone",
+            _ => "changed on both, and kit can't merge it (not a text file)",
         };
-        warn(&format!("~/{rel} {why}"));
+        warn(&format!("~/{rel} {why} — kit status ~/{rel} compares them, kit undo ~/{rel} takes the repo's, kit save --force ~/{rel} keeps this one"));
     }
     if !conflicts.is_empty() {
         warn(&format!("{} file(s) changed in the same place on both machines:", conflicts.len()));

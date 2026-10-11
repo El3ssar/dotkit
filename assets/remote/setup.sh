@@ -281,11 +281,11 @@ while read -r name bin primary fallback; do
 done < "$P/packages.list"
 for core in zsh nvim; do total=$((total + 1)); runs "$core" || failed="$failed $core"; done
 
-echo "$(cat "$P/.stamp")" > "$KIT/.stamp"
 if [ -n "$failed" ]; then
   warn "$(( total - $(echo $failed | wc -w) ))/$total tools work; NOT working:$failed"
   warn "logs: $KIT/state/kit-*.log"
   exit 1
 fi
+cat "$P/.stamp" > "$KIT/.stamp"   # only after everything works: the next run can skip this setup
 if [ "$MODE" = remote ]; then say "all $total tools work — next ssh login drops you into your environment"
 else say "all $total tools work"; fi

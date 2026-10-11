@@ -1653,7 +1653,7 @@ def merge_d_no_base_left_alone(sb):
     r = m2.kit("sync", code=None)
     ok(m2.read(".zshrc") == "m2's own zshrc\n", "a never-synced file was overwritten")
     hasnt(m2.read(".zshrc"), "<<<<<<<")
-    has(r.both, ".zshrc", "changed on both")
+    has(r.both, ".zshrc", "differs from the repo")
     r = check_status(m2, "changed on both", "~/.zshrc")
     ok(m2.repo_read("home/.zshrc") == "from m1\n")
     m2.kit("undo", "~/.zshrc")

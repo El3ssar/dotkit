@@ -247,9 +247,13 @@ fn remove_from(host: &str) {
 /// ~/.local/kit, but using your real ~/.config and ~/.fizsh.
 pub fn linux_environment() {
     let home = &ctx().home;
-    say("setting up tools, zsh and nvim in ~/.local/kit");
     let payload = home.join(REMOTE_KIT).join("payload");
-    build_payload(&payload, "local");
+    let stamp = build_payload(&payload, "local");
+    let done = std::fs::read_to_string(home.join(REMOTE_KIT).join(".stamp")).unwrap_or_default();
+    if done.trim() == stamp {
+        return; // set up already, and nothing it depends on changed
+    }
+    say("setting up tools, zsh and nvim in ~/.local/kit");
     let env = vec![("KIT_HOOK".to_string(), "0".to_string())];
     let setup = path_str(&payload.join("remote/setup.sh"));
     if run_full(&["bash", setup.as_str()], false, None, Some(&env), None).code != 0 {
