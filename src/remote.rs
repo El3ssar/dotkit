@@ -6,99 +6,224 @@ use crate::util::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// The scripts that run on servers, built into kit.
 const REMOTE_FILES: &[(&str, &str)] = &[
+    (
+        "bootstrap.sh",
+        include_str!("../assets/remote/bootstrap.sh"),
+    ),
+    ("deploy.sh", include_str!("../assets/remote/deploy.sh")),
+    (
+        "install-fizsh.sh",
+        include_str!("../assets/remote/install-fizsh.sh"),
+    ),
     ("setup.sh", include_str!("../assets/remote/setup.sh")),
     ("hook.sh", include_str!("../assets/remote/hook.sh")),
     ("kit-env", include_str!("../assets/remote/kit-env")),
     ("kit-shell", include_str!("../assets/remote/kit-shell")),
 ];
-const REMOTE_MAP: &[(&str, &str)] = &[(".config/", "config/"), (".fizsh/", "fizsh/")]; // what travels, and where it lands
-const RC_FILES: &[&str] = &[".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".fizsh/.zshrc"];
+const RC_FILES: &[&str] = &[
+    ".zshenv",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".fizsh/.zshrc",
+];
 const KITTY: &str = "/Applications/kitty.app/Contents/Resources/kitty";
 
 fn write_file(p: &Path, data: &[u8], mode: u32) {
     if let Some(parent) = p.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).unwrap_or_else(|e| die(&format!("cannot build payload: {e}")));
     }
-    let _ = fs::write(p, data);
-    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+    write_atomic(p, data, mode)
+        .unwrap_or_else(|e| die(&format!("cannot build payload {}: {e}", p.display())));
 }
 
 /// Everything setup.sh needs, for a server (mode=remote) or this Linux machine (mode=local).
 pub fn build_payload(dest: &Path, mode: &str) -> String {
+    build_payload_for(dest, mode, "linux")
+}
+
+fn build_payload_for(dest: &Path, mode: &str, platform: &str) -> String {
     if dest.exists() {
-        let _ = fs::remove_dir_all(dest);
+        fs::remove_dir_all(dest).unwrap_or_else(|e| die(&format!("cannot clear payload: {e}")));
     }
-    for sub in ["remote", "config", "fizsh", "share"] {
-        let _ = fs::create_dir_all(dest.join(sub));
+    for sub in ["remote", "home", "commands", "share"] {
+        fs::create_dir_all(dest.join(sub))
+            .unwrap_or_else(|e| die(&format!("cannot build payload: {e}")));
     }
     for (name, text) in REMOTE_FILES {
         write_file(&dest.join("remote").join(name), text.as_bytes(), 0o755);
     }
     write_file(&dest.join("mode"), format!("{mode}\n").as_bytes(), 0o644);
     let tracked = managed(None);
+    let mut home_list = Vec::new();
     if mode == "remote" {
-        let ctxs = ["all", "linux", "remote"];
+        let ctxs = ["all", platform, "remote"];
         for rel in &tracked {
+            validate_rel(rel).unwrap_or_else(|e| die(&e));
             if ignored(rel, &ctxs) {
                 continue;
             }
-            for (prefix, target) in REMOTE_MAP {
-                if let Some(rest) = rel.strip_prefix(prefix) {
-                    let p = dest.join(target).join(rest);
-                    if let Some(parent) = p.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    match source_entry(rel, &ctxs) {
-                        Ok(Some(Entry::Link(t))) => {
-                            let _ = std::os::unix::fs::symlink(t, &p);
-                        }
-                        Ok(Some(Entry::File(b, m))) => write_file(&p, &b, if m & 0o111 != 0 { 0o755 } else { 0o644 }),
-                        _ => {}
-                    }
-                    break;
+            let p = dest.join("home").join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap_or_else(|e| die(&e.to_string()));
+            match source_entry(rel, &ctxs) {
+                Ok(Some(Entry::Link(t))) => {
+                    std::os::unix::fs::symlink(t, &p).unwrap_or_else(|e| die(&e.to_string()))
                 }
+                Ok(Some(Entry::File(b, m))) => write_file(
+                    &p,
+                    &b,
+                    if private(rel) {
+                        if m & 0o111 != 0 {
+                            0o700
+                        } else {
+                            0o600
+                        }
+                    } else if m & 0o111 != 0 {
+                        0o755
+                    } else {
+                        0o644
+                    },
+                ),
+                _ => die(&format!("cannot read payload file ~/{rel}")),
             }
+            home_list.extend_from_slice(rel.as_bytes());
+            home_list.push(0);
         }
     }
+    write_file(&dest.join("home.list"), &home_list, 0o644);
     // rc files kit tracks on this machine: the login hook never goes into those
-    let rc: String = tracked.iter().filter(|r| mode == "local" && RC_FILES.contains(&r.as_str())).map(|r| format!("{r}\n")).collect();
+    let rc: String = tracked
+        .iter()
+        .filter(|r| mode == "local" && RC_FILES.contains(&r.as_str()))
+        .map(|r| format!("{r}\n"))
+        .collect();
     write_file(&dest.join("managed-rc.list"), rc.as_bytes(), 0o644);
-    // tools: a mise config generated from packages.json
-    let mut lines = vec!["# generated by kit from packages.json — edit with `kit pkg ...`".to_string(), "[tools]".to_string()];
+    let mut tools = std::collections::BTreeMap::new();
     let mut plist = String::new();
+    let mut seen_bins = std::collections::BTreeSet::new();
     for (n, p) in crate::pkg::all_packages() {
-        let Some(linux) = s(&p, "linux") else { continue };
         if mode != "local" && !p.get("remote").and_then(Value::as_bool).unwrap_or(true) {
             continue;
         }
-        let (base, ver) = split_spec(linux);
-        let ver = ver.unwrap_or_else(|| "latest".into());
-        lines.push(format!("{} = {}", Value::from(base.clone()), Value::from(ver.clone())));
-        let fb = s(&p, "linux_fallback").map(|fb| {
-            let (fbase, fver) = split_spec(fb);
-            format!("{fbase}@{}", fver.unwrap_or_else(|| "latest".into()))
-        });
-        plist += &format!("{n} {} {base}@{ver} {}\n", s(&p, "bin").unwrap_or(&n), fb.unwrap_or_else(|| "-".into()));
+        let recipe = s(&p, platform);
+        if platform == "linux"
+            && recipe.is_none()
+            && s(&p, "mac").is_some_and(|s| s.starts_with("cask:"))
+        {
+            note(&format!("{n}: Mac application, skipped on Linux"));
+            continue;
+        }
+        let bin = crate::pkg::package_bin_for(&n, &p, platform);
+        if !seen_bins.insert(bin.to_string()) && recipe.is_none() {
+            continue;
+        }
+        let mut spec = recipe.unwrap_or("missing:recipe").to_string();
+        if let Some(rest) = spec.strip_prefix("mise:") {
+            spec = rest.into();
+        }
+        if platform == "mac" && (spec.starts_with("brew:") || spec.starts_with("cask:")) {
+            let (kind, what) = spec.split_once(':').unwrap();
+            let brew = format!(
+                "brew install {}'{}'",
+                if kind == "cask" { "--cask " } else { "" },
+                what.replace('\'', "'\\''")
+            );
+            let alternative = s(&p, "linux").filter(|spec| crate::pkg::is_mise_spec(spec));
+            let fallback = alternative
+                .map(|spec| format!("mise use --global '{}'", spec.replace('\'', "'\\''")))
+                .unwrap_or_else(|| {
+                    "echo 'Homebrew is required for this Mac package' >&2; exit 1".into()
+                });
+            let script = format!("#!/bin/sh\nset -eu\nif command -v brew >/dev/null; then {brew}; else {fallback}; fi\n");
+            write_file(
+                &dest.join("commands").join(format!("{n}.sh")),
+                script.as_bytes(),
+                0o700,
+            );
+            spec = format!("cmd:{n}");
+        } else if let Some(command) = spec.strip_prefix("cmd:") {
+            if command.contains("uv tool") {
+                tools
+                    .entry("aqua:astral-sh/uv".into())
+                    .or_insert_with(|| "latest".into());
+                tools
+                    .entry("core:python".into())
+                    .or_insert_with(|| "3.12".into());
+            }
+            write_file(
+                &dest.join("commands").join(format!("{n}.sh")),
+                format!("#!/bin/sh\nset -eu\n{command}\n").as_bytes(),
+                0o700,
+            );
+            spec = format!("cmd:{n}");
+        } else if spec == "builtin:nvim" {
+            tools.insert("aqua:neovim/neovim".into(), "0.12.6".into());
+        } else if crate::pkg::is_mise_spec(&spec) {
+            let (base, ver) = split_spec(&spec);
+            let ver = ver.unwrap_or_else(|| "latest".into());
+            spec = format!("{base}@{ver}");
+            tools.insert(base, ver);
+        }
+        let fb = s(&p, "linux_fallback").unwrap_or("-");
+        plist += &format!("{n}\t{bin}\t{spec}\t{fb}\n");
     }
-    write_file(&dest.join("mise.toml"), (lines.join("\n") + "\n").as_bytes(), 0o644);
+    for (key, _) in tools.clone() {
+        let dep = if key.starts_with("cargo:") {
+            Some(("core:rust", "stable"))
+        } else if key.starts_with("npm:") {
+            Some(("core:node", "lts"))
+        } else if key.starts_with("go:") {
+            Some(("core:go", "latest"))
+        } else if key.starts_with("pypi:") {
+            Some(("aqua:astral-sh/uv", "latest"))
+        } else {
+            None
+        };
+        if let Some((name, version)) = dep {
+            tools.entry(name.into()).or_insert_with(|| version.into());
+        }
+    }
+    let toml = "# generated by kit\n[tools]\n".to_string()
+        + &tools
+            .iter()
+            .map(|(k, v)| format!("{} = {}\n", Value::from(k.clone()), Value::from(v.clone())))
+            .collect::<String>();
+    write_file(&dest.join("mise.toml"), toml.as_bytes(), 0o644);
     write_file(&dest.join("packages.list"), plist.as_bytes(), 0o644);
     let mut ext = String::new();
     for (rel, spec) in load_obj(&ctx().externals) {
-        let rel = norm(&rel);
-        if !rel.starts_with("..") && !rel.starts_with('/') {
-            let url = spec.get("git").and_then(Value::as_str).unwrap_or("");
-            ext += &format!("{rel} {url} {}\n", spec.get("ref").and_then(Value::as_str).unwrap_or(""));
+        validate_rel(&rel).unwrap_or_else(|e| die(&format!("externals.json: {e}")));
+        if never_track(&rel) {
+            die("externals.json cannot target kit's own folders");
         }
+        if ignored(&rel, &["all", platform, "remote"]) && mode == "remote" {
+            continue;
+        }
+        let url = spec.get("git").and_then(Value::as_str).unwrap_or("");
+        let reference = spec.get("ref").and_then(Value::as_str).unwrap_or("");
+        if url.is_empty()
+            || url.starts_with('-')
+            || url.contains(['\t', '\n', '\r'])
+            || reference.contains(['\t', '\n', '\r'])
+        {
+            die("invalid external repository URL/ref");
+        }
+        ext += &format!("{rel}\t{url}\t{reference}\n");
     }
     write_file(&dest.join("externals.list"), ext.as_bytes(), 0o644);
     let kitty = PathBuf::from(KITTY);
     if kitty.join("shell-integration").is_dir() {
-        let _ = copy_dir(&kitty.join("shell-integration"), &dest.join("share/kitty/shell-integration"));
+        let _ = copy_dir(
+            &kitty.join("shell-integration"),
+            &dest.join("share/kitty/shell-integration"),
+        );
     }
     let ti = kitty.join("terminfo/78/xterm-kitty");
     if ti.is_file() {
@@ -116,7 +241,10 @@ pub fn build_payload(dest: &Path, mode: &str) -> String {
         } else {
             h.update(rel.as_bytes());
             h.update(b"\0");
-            h.update(fs::read(&p).unwrap_or_default());
+            h.update(fs::read(&p).unwrap_or_else(|e| die(&format!("cannot hash payload: {e}"))));
+            if let Some(Entry::File(_, mode)) = read_entry(&p) {
+                h.update(mode.to_le_bytes());
+            }
         }
     }
     let stamp = hex::encode(h.finalize())[..12].to_string();
@@ -125,13 +253,31 @@ pub fn build_payload(dest: &Path, mode: &str) -> String {
 }
 
 fn ssh_opts() -> Vec<String> {
-    ["-o", "ConnectTimeout=15", "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/kit-ssh-%C", "-o", "ControlPersist=60"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    let dir = ctx().state.join("ssh");
+    fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| die(&format!("cannot create SSH socket directory: {e}")));
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|e| die(&e.to_string()));
+    let socket = format!("{}/%C", dir.display());
+    let mut options = vec!["-o".into(), "ConnectTimeout=15".into()];
+    if socket.len() + 40 < 100 {
+        options.extend([
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={socket}"),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ]);
+    }
+    options
 }
 
 fn ssh(host: &str, script: &str, capture: bool) -> Out {
+    if host.starts_with('-') || host.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        die("invalid SSH host");
+    }
     let mut cmd = vec!["ssh".to_string()];
     cmd.extend(ssh_opts());
     cmd.push(host.into());
@@ -139,35 +285,124 @@ fn ssh(host: &str, script: &str, capture: bool) -> Out {
     run(&cmd, capture)
 }
 
+/// Stream a staged payload over SSH; the target only needs bash and tar, not rsync.
+fn send_payload(host: &str, payload: &Path) -> i32 {
+    use std::process::{Command, Stdio};
+    let script = "set -eu; mkdir -p \"$HOME/.local/kit\"; stage=$(mktemp -d \"$HOME/.local/kit/upload.XXXXXX\"); trap 'rm -rf \"$stage\"' EXIT; tar -xzf - -C \"$stage\"; KIT_PAYLOAD=\"$stage\" bash \"$stage/remote/setup.sh\"";
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd.env("COPYFILE_DISABLE", "1");
+    if cfg!(target_os = "macos") {
+        tar_cmd.args(["--no-xattrs", "--no-mac-metadata"]);
+    }
+    let mut tar = tar_cmd
+        .arg("-C")
+        .arg(payload)
+        .args(["-czf", "-", "."])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| die(&e.to_string()));
+    let mut ssh_cmd = Command::new(which("ssh").unwrap());
+    ssh_cmd
+        .args(ssh_opts())
+        .arg("--")
+        .arg(host)
+        .arg(script)
+        .stdin(tar.stdout.take().unwrap());
+    let ssh_status = ssh_cmd.status();
+    let tar_status = tar.wait();
+    match (ssh_status, tar_status) {
+        (Ok(ssh), Ok(tar)) if ssh.success() && tar.success() => 0,
+        (Ok(ssh), _) if !ssh.success() => ssh.code().unwrap_or(1),
+        _ => 1,
+    }
+}
+
 fn not_sent_summary() -> String {
-    let ctxs = ["all", "linux", "remote"];
-    let rels = managed(None);
-    let travels = |r: &str| REMOTE_MAP.iter().any(|(p, _)| r.starts_with(p));
-    let outside: Vec<&String> = rels.iter().filter(|r| !travels(r)).collect();
-    let kept = rels.iter().filter(|r| travels(r) && ignored(r, &ctxs)).count();
-    let mut tops: Vec<String> = outside.iter().map(|r| r.split('/').take(2).collect::<Vec<_>>().join("/")).collect();
-    tops.sort();
-    tops.dedup();
-    let mut msg = Vec::new();
-    if !outside.is_empty() {
-        let eg: Vec<String> = tops.iter().take(3).map(|t| format!("~/{t}")).collect();
-        msg.push(format!("{} file(s) outside ~/.config and ~/.fizsh (e.g. {})", outside.len(), eg.join(", ")));
+    let kept = managed(None)
+        .iter()
+        .filter(|r| ignored(r, &["all", "linux", "remote"]))
+        .count();
+    if kept == 0 {
+        String::new()
+    } else {
+        format!("{kept} file(s) excluded by .kitignore")
     }
-    if kept > 0 {
-        msg.push(format!("{kept} file(s) in .kitignore [remote]"));
+}
+
+/// Activate private tool shims in ordinary shells, including on macOS without Homebrew.
+pub fn install_activation() {
+    let kit = ctx().home.join(REMOTE_KIT);
+    for (name, bytes) in [
+        (
+            "kit-env",
+            include_bytes!("../assets/remote/kit-env").as_slice(),
+        ),
+        (
+            "kit-shell",
+            include_bytes!("../assets/remote/kit-shell").as_slice(),
+        ),
+    ] {
+        write_file(&kit.join("bin").join(name), bytes, 0o755);
     }
-    msg.join(" · ")
+    write_file(
+        &kit.join("bin/fizsh"),
+        include_bytes!("../assets/remote/kit-shell"),
+        0o755,
+    );
+    let payload = kit.join("activation");
+    write_file(
+        &payload.join("remote/hook.sh"),
+        include_bytes!("../assets/remote/hook.sh"),
+        0o755,
+    );
+    write_file(&payload.join("mode"), b"local\n", 0o644);
+    let rc = managed(None)
+        .into_iter()
+        .filter(|r| RC_FILES.contains(&r.as_str()))
+        .map(|r| format!("{r}\n"))
+        .collect::<String>();
+    write_file(&payload.join("managed-rc.list"), rc.as_bytes(), 0o644);
+    if run(
+        &[
+            "bash",
+            &path_str(&payload.join("remote/hook.sh")),
+            "install",
+        ],
+        false,
+    )
+    .code
+        != 0
+    {
+        fail("shell activation failed");
+    }
+}
+
+pub fn ensure_mise() {
+    if have("mise") {
+        return;
+    }
+    let script = ctx().state.join("bootstrap.sh");
+    write_file(
+        &script,
+        include_bytes!("../assets/remote/bootstrap.sh"),
+        0o700,
+    );
+    if run(&["bash", &path_str(&script)], false).code != 0 {
+        die("could not bootstrap mise; see the prerequisite/download error above");
+    }
 }
 
 pub fn cmd_push(a: &Args) {
     let cx = ctx();
-    if !have("rsync") || !have("ssh") {
-        die("kit push needs ssh and rsync");
+    if !have("tar") || !have("ssh") {
+        die("kit push needs ssh and tar");
     }
     guard_repo();
     let mut remotes = load_obj(&cx.remotes);
     if a.flag("remove") {
-        let Some(host) = a.one("host") else { die("which server? kit push <host> --remove") };
+        let Some(host) = a.one("host") else {
+            die("which server? kit push <host> --remove")
+        };
         return remove_from(&host);
     }
     let hosts: Vec<String> = match a.one("host") {
@@ -178,13 +413,17 @@ pub fn cmd_push(a: &Args) {
         say("no servers yet — kit push <host> puts your environment on one");
         return;
     }
-    let pending = file_changes(None, &load_synced()).into_iter().filter(|(c, _)| matches!(*c, "here" | "new" | "deleted" | "both")).count();
+    let pending = file_changes(None, &load_synced())
+        .into_iter()
+        .filter(|(c, _)| matches!(*c, "here" | "new" | "deleted" | "both"))
+        .count();
     if pending > 0 {
         warn(&format!("{pending} change(s) on this machine aren't in the repo, so servers get the repo's version (kit save first to send yours)"));
     }
+    ensure_mise();
     let payload = cx.state.join("payload");
     say("building");
-    let stamp = build_payload(&payload, "remote");
+    build_payload(&payload, "remote");
     let summary = not_sent_summary();
     if !summary.is_empty() {
         note(&format!("not sent to servers: {summary}"));
@@ -192,39 +431,58 @@ pub fn cmd_push(a: &Args) {
     for host in &hosts {
         if !remotes.contains_key(host) {
             out(&format!(
-                "First push to {host}: your environment goes into ~/{REMOTE_KIT} there (about 1–2 GB with nvim's language servers),\n\
-                 and a small block at the end of its ~/.bashrc makes interactive logins start your shell\n\
-                 (scp, rsync and `ssh {host} <command>` are unaffected). Undo any time: kit push {host} --remove"
+                "First push to {host}: tracked dotfiles go into its home folder; existing files are backed up in ~/{REMOTE_KIT}/originals.\n\
+                 Tools live in ~/{REMOTE_KIT}, and interactive SSH logins start your configured shell.\n\
+                 Noninteractive SSH and file transfers stay usable. Restore the originals and remove kit: kit push {host} --remove"
             ));
         }
+        if host.starts_with('-') || host.contains(['\n', '\r', '\0', ' ']) {
+            fail("invalid SSH host");
+            continue;
+        }
+        let platform = ssh(host, "uname -s", true);
+        let platform = match platform.stdout.trim() {
+            "Darwin" => "mac",
+            "Linux" | "" => "linux",
+            _ => {
+                fail(&format!("{host}: unsupported OS"));
+                continue;
+            }
+        };
+        let stamp = build_payload_for(&payload, "remote", platform);
         say(&format!("syncing to {host}"));
         if ssh(host, &format!("mkdir -p ~/{REMOTE_KIT}/payload"), false).code != 0 {
             fail(&format!("{host}: can't reach it over ssh"));
             continue;
         }
-        let e = format!("ssh {}", ssh_opts().join(" "));
-        let src = format!("{}/", payload.display());
-        let dst = format!("{host}:{REMOTE_KIT}/payload/");
-        if run(&["rsync", "-az", "--delete", "-e", &e, &src, &dst], false).code != 0 {
-            fail(&format!("{host}: copying failed"));
-            continue;
-        }
         say(&format!("setting up {host}"));
-        let rc = ssh(host, &format!("bash ~/{REMOTE_KIT}/payload/remote/setup.sh"), false).code;
+        let rc = send_payload(host, &payload);
         let record = |stamp: &str, at: &str| serde_json::json!({"stamp": stamp, "at": at});
         if rc == 0 {
-            remotes.insert(host.clone(), record(&stamp, &chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string()));
+            remotes.insert(
+                host.clone(),
+                record(
+                    &stamp,
+                    &chrono::Local::now().format("%Y-%m-%dT%H:%M").to_string(),
+                ),
+            );
             save_json(&cx.remotes, &Value::Object(remotes.clone()));
         } else if rc == 255 {
             fail(&format!("{host}: lost the ssh connection during setup"));
         } else {
-            remotes.entry(host.clone()).or_insert_with(|| record("", ""));
+            remotes
+                .entry(host.clone())
+                .or_insert_with(|| record("", ""));
             save_json(&cx.remotes, &Value::Object(remotes.clone()));
             fail(&format!("{host}: setup reported problems (see above)"));
         }
     }
     if hosts.len() > 1 {
-        say(if exit_code() == 0 { "done" } else { "done, with problems (see above)" });
+        say(if exit_code() == 0 {
+            "done"
+        } else {
+            "done, with problems (see above)"
+        });
     }
 }
 
@@ -232,7 +490,7 @@ pub fn cmd_push(a: &Args) {
 fn remove_from(host: &str) {
     let cx = ctx();
     let script = format!(
-        "if [ -f ~/{REMOTE_KIT}/payload/remote/hook.sh ]; then bash ~/{REMOTE_KIT}/payload/remote/hook.sh remove; fi && rm -rf ~/{REMOTE_KIT} ~/.kit-off && echo \"kit removed from $(hostname)\""
+        "if [ -f ~/{REMOTE_KIT}/payload/remote/hook.sh ]; then bash ~/{REMOTE_KIT}/payload/remote/hook.sh remove; fi && if [ -f ~/{REMOTE_KIT}/payload/remote/deploy.sh ]; then bash ~/{REMOTE_KIT}/payload/remote/deploy.sh remove; fi && mkdir -p ~/.local/state/kit-remote-backups && if [ -d ~/{REMOTE_KIT}/backups ]; then mv ~/{REMOTE_KIT}/backups ~/.local/state/kit-remote-backups/$(date +%Y%m%d-%H%M%S)-$$; fi && rm -rf ~/{REMOTE_KIT} ~/.kit-off && echo \"kit removed from $(hostname)\""
     );
     if ssh(host, &script, false).code != 0 {
         fail(&format!("could not remove kit from {host}"));
@@ -248,11 +506,7 @@ fn remove_from(host: &str) {
 pub fn linux_environment() {
     let home = &ctx().home;
     let payload = home.join(REMOTE_KIT).join("payload");
-    let stamp = build_payload(&payload, "local");
-    let done = std::fs::read_to_string(home.join(REMOTE_KIT).join(".stamp")).unwrap_or_default();
-    if done.trim() == stamp {
-        return; // set up already, and nothing it depends on changed
-    }
+    build_payload(&payload, "local");
     say("setting up tools, zsh and nvim in ~/.local/kit");
     let env = vec![("KIT_HOOK".to_string(), "0".to_string())];
     let setup = path_str(&payload.join("remote/setup.sh"));

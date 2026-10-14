@@ -18,7 +18,12 @@ pub struct Meta {
 }
 
 pub fn script_meta(path: &Path) -> Meta {
-    let mut m = Meta { on: None, run: "onchange".into(), watch: vec![], errors: vec![] };
+    let mut m = Meta {
+        on: None,
+        run: "onchange".into(),
+        watch: vec![],
+        errors: vec![],
+    };
     let text = String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned();
     let header = regex::Regex::new(r"^#\s*kit:\s*(\w+)\s*=\s*(.+)").unwrap();
     let trailing = regex::Regex::new(r"\s+#.*$").unwrap();
@@ -27,7 +32,9 @@ pub fn script_meta(path: &Path) -> Meta {
         if !s.is_empty() && !s.starts_with('#') {
             break; // only the comment block at the top
         }
-        let Some(caps) = header.captures(s) else { continue };
+        let Some(caps) = header.captures(s) else {
+            continue;
+        };
         let key = caps[1].to_lowercase();
         let val = trailing.replace(&caps[2], "").trim().to_string();
         match key.as_str() {
@@ -44,10 +51,13 @@ pub fn script_meta(path: &Path) -> Meta {
                 if ["onchange", "once", "always"].contains(&v.as_str()) {
                     m.run = v;
                 } else {
-                    m.errors.push(format!("run={val} (use onchange, once or always)"));
+                    m.errors
+                        .push(format!("run={val} (use onchange, once or always)"));
                 }
             }
-            _ => m.errors.push(format!("unknown header '{key}' (use on, run or watch)")),
+            _ => m
+                .errors
+                .push(format!("unknown header '{key}' (use on, run or watch)")),
         }
     }
     m
@@ -71,7 +81,11 @@ pub fn script_hash(path: &Path, meta: &Meta) -> String {
             }
         } else {
             h.update(rel.as_bytes());
-            h.update(if f.is_file() { fs::read(&f).unwrap_or_default() } else { b"<missing>".to_vec() });
+            h.update(if f.is_file() {
+                fs::read(&f).unwrap_or_default()
+            } else {
+                b"<missing>".to_vec()
+            });
         }
     }
     hex::encode(h.finalize())[..16].to_string()
@@ -86,7 +100,12 @@ pub fn script_status() -> Vec<(PathBuf, Meta, &'static str)> {
     let cx = ctx();
     let done = done_map();
     let mut files: Vec<PathBuf> = fs::read_dir(&cx.scripts)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "sh")).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sh"))
+                .collect()
+        })
         .unwrap_or_default();
     files.sort();
     files
@@ -99,8 +118,14 @@ pub fn script_status() -> Vec<(PathBuf, Meta, &'static str)> {
             } else if meta.run == "always" {
                 "pending"
             } else if meta.run == "once" {
-                if done.contains_key(&name) { "done" } else { "pending" }
-            } else if done.get(&name).and_then(Value::as_str) == Some(script_hash(&f, &meta).as_str()) {
+                if done.contains_key(&name) {
+                    "done"
+                } else {
+                    "pending"
+                }
+            } else if done.get(&name).and_then(Value::as_str)
+                == Some(script_hash(&f, &meta).as_str())
+            {
                 "done"
             } else {
                 "pending"
@@ -111,11 +136,17 @@ pub fn script_status() -> Vec<(PathBuf, Meta, &'static str)> {
 }
 
 fn stem(p: &Path) -> String {
-    p.file_stem().unwrap_or_default().to_string_lossy().into_owned()
+    p.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn name(p: &Path) -> String {
-    p.file_name().unwrap_or_default().to_string_lossy().into_owned()
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
@@ -151,7 +182,14 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
         // on Linux, scripts get the kit's tools (bat, delta, …) the same way your kit shell does
         let kit_env = cx.home.join(REMOTE_KIT).join("bin/kit-env");
         let cmd: Vec<String> = if !cx.is_mac && kit_env.is_file() {
-            vec!["bash".into(), "-c".into(), ". \"$1\" && exec bash \"$2\"".into(), "kit".into(), path_str(&kit_env), fstr.clone()]
+            vec![
+                "bash".into(),
+                "-c".into(),
+                ". \"$1\" && exec bash \"$2\"".into(),
+                "kit".into(),
+                path_str(&kit_env),
+                fstr.clone(),
+            ]
         } else {
             vec!["bash".into(), fstr.clone()]
         };
@@ -159,7 +197,10 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
             done.insert(name(&f), Value::from(script_hash(&f, &meta)));
             save_json(&cx.script_state, &Value::Object(done.clone()));
         } else {
-            fail(&format!("script {} failed; it runs again on the next `kit sync`", name(&f)));
+            fail(&format!(
+                "script {} failed; it runs again on the next `kit sync`",
+                name(&f)
+            ));
         }
     }
 }

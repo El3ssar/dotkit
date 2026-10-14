@@ -9,7 +9,7 @@
 //!   externals.json  git checkouts placed into $HOME (e.g. antidote)
 //!   scripts/        run by `kit sync`
 //!   remotes.json    servers you pushed to (managed by `kit push`)
-//!   dirs.json       folders added whole: new files in them show up in `kit status`
+//!   dirs.json       folders added whole: groups of explicitly tracked files
 //!   .kitignore      never tracked; [remote]/[mac]/[linux] sections
 //!
 //! Per-machine state (what was last synced, backups, script runs) lives in
@@ -19,15 +19,16 @@ mod complete;
 mod core;
 mod diff;
 mod files;
+mod packages;
 mod pkg;
 mod remote;
 mod scripts;
+mod updates;
 mod util;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use cli::{build_cli, Args};
 use util::*;
-
 
 /// Edit distance where swapping two neighbouring letters counts as one typo.
 fn typo_distance(a: &str, b: &str) -> usize {
@@ -42,7 +43,9 @@ fn typo_distance(a: &str, b: &str) -> usize {
     for i in 1..=a.len() {
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            d[i][j] = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
                 d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
             }
@@ -53,12 +56,19 @@ fn typo_distance(a: &str, b: &str) -> usize {
 
 fn closest(bad: &str, names: &[String]) -> Option<String> {
     let limit = (bad.chars().count() / 3).max(2);
-    names.iter().map(|n| (typo_distance(bad, n), n)).filter(|(d, _)| *d <= limit).min_by_key(|(d, _)| *d).map(|(_, n)| n.clone())
+    names
+        .iter()
+        .map(|n| (typo_distance(bad, n), n))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, n)| n.clone())
 }
 
 fn usage_error(e: clap::Error, argv: &[String]) -> ! {
     match e.kind() {
-        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
             let _ = e.print();
             std::process::exit(0);
         }
@@ -69,12 +79,22 @@ fn usage_error(e: clap::Error, argv: &[String]) -> ! {
             };
             let parent = build_cli();
             let scope = match argv.first() {
-                Some(first) if first != &bad => parent.find_subcommand(first).cloned().unwrap_or_else(build_cli),
+                Some(first) if first != &bad => parent
+                    .find_subcommand(first)
+                    .cloned()
+                    .unwrap_or_else(build_cli),
                 _ => parent,
             };
-            let names: Vec<String> = scope.get_subcommands().map(|c| c.get_name().to_string()).collect();
+            let names: Vec<String> = scope
+                .get_subcommands()
+                .map(|c| c.get_name().to_string())
+                .collect();
             let near = closest(&bad, &names);
-            let what = if argv.first().is_some_and(|a| a != &bad) { "action" } else { "command" };
+            let what = if argv.first().is_some_and(|a| a != &bad) {
+                "action"
+            } else {
+                "command"
+            };
             match near {
                 Some(n) => die_code(&format!("unknown {what} '{bad}' — did you mean '{n}'?"), 2),
                 None => die_code(&format!("unknown {what} '{bad}' (kit --help)"), 2),
@@ -96,6 +116,7 @@ fn dispatch(m: &clap::ArgMatches) {
     match name {
         "init" => files::cmd_init(&a),
         "add" => files::cmd_add(&a),
+        "packages" => packages::command(&a),
         "rm" => files::cmd_rm(&a),
         "status" => files::cmd_status(&a),
         "save" => files::cmd_save(&a),
@@ -114,7 +135,11 @@ fn main() {
     }
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("__complete") {
-        let words: Vec<String> = if argv.get(1).map(String::as_str) == Some("--") { argv[2..].to_vec() } else { argv[1..].to_vec() };
+        let words: Vec<String> = if argv.get(1).map(String::as_str) == Some("--") {
+            argv[2..].to_vec()
+        } else {
+            argv[1..].to_vec()
+        };
         let lines = complete::complete(&words);
         if !lines.is_empty() {
             out(&lines.join("\n"));
@@ -122,12 +147,23 @@ fn main() {
         return;
     }
     if argv.first().map(String::as_str) == Some("help") {
-        argv = argv[1..].iter().take(2).cloned().chain(["--help".to_string()]).collect();
+        argv = argv[1..]
+            .iter()
+            .take(2)
+            .cloned()
+            .chain(["--help".to_string()])
+            .collect();
     }
-    let m = build_cli().try_get_matches_from(std::iter::once("kit".to_string()).chain(argv.iter().cloned())).unwrap_or_else(|e| usage_error(e, &argv));
+    let m = build_cli()
+        .try_get_matches_from(std::iter::once("kit".to_string()).chain(argv.iter().cloned()))
+        .unwrap_or_else(|e| usage_error(e, &argv));
     let cmd = m.subcommand_name().unwrap_or("");
+    let _locks = (!cmd.is_empty()).then(lock_workspace);
     if !cmd.is_empty() && cmd != "init" && cmd != "completion" && !ctx().source.exists() {
-        die(&format!("no kit repo at {} — run `kit init` (or `kit init <git-url>`)", tilde(&ctx().source)));
+        die(&format!(
+            "no kit repo at {} — run `kit init` (or `kit init <git-url>`)",
+            tilde(&ctx().source)
+        ));
     }
     if !cmd.is_empty() {
         files::migrate_state();

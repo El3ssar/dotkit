@@ -1,294 +1,234 @@
 #!/usr/bin/env bash
-# Runs ON the remote (called by `kit push`). Installs or updates ~/.local/kit from the
-# payload the Mac just synced to ~/.local/kit/payload. Safe to run again: tools whose
-# version didn't change are skipped, shell history and other state are kept.
+# Reconcile the desired environment. Every tool gets its own result and log; retries are safe.
 set -euo pipefail
-
-KIT="$HOME/.local/kit"
-P="$KIT/payload"
-ZSH_BIN_VERSION="v6.1.1"   # romkatv/zsh-bin release (static, relocatable zsh 5.8)
-NVIM_VERSION="0.12.5"      # neovim/neovim-releases: built against glibc 2.17, runs almost anywhere
-NCURSES_VERSION="6.5"      # built only when the system has no ncurses headers (cbonsai dashboard)
-MISE_VERSION="2026.10.3"   # installs every tool in packages.json (see mise.toml)
-MODE=$(cat "$P/mode" 2>/dev/null || echo remote)   # remote: a server (configs live in the kit) · local: your own Linux machine
-
-say()  { printf '\033[32m›\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
-
-case "$(uname -m)" in
-  x86_64|amd64) ARCH=x86_64 ARCH_RE='x86_64|amd64|x64' ;;
-  aarch64|arm64) ARCH=aarch64 ARCH_RE='aarch64|arm64' ;;
-  *) echo "kit: unsupported architecture $(uname -m)" >&2; exit 1 ;;
-esac
-[ "$(uname -s)" = Linux ] || { echo "kit: only Linux remotes are supported" >&2; exit 1; }
-
-mkdir -p "$KIT"/{bin,opt/.versions,config,data,state,cache,fizsh,share}
-
-# --- helpers ---------------------------------------------------------------
-installed() { [ "$(cat "$KIT/opt/.versions/$1" 2>/dev/null)" = "$2" ]; }
-mark()      { echo "$2" > "$KIT/opt/.versions/$1"; }
-
-fetch() {  # url dest
-  curl -fsSL --retry 3 --connect-timeout 20 -o "$2" "$1" || { warn "download failed: $1"; return 1; }
-}
-
-unpack() {  # archive dir
-  case "$1" in
-    *.tar.gz|*.tgz) tar -xzf "$1" -C "$2" ;;
-    *.tar.xz)       tar -xJf "$1" -C "$2" ;;
-    *.zip)          unzip -qo "$1" -d "$2" ;;
-    *)              return 1 ;;
-  esac
-}
-
-install_tool() {  # name version url bins
-  local name=$1 ver=$2 url=${3//\{v\}/$2} bins=$4 b
-  local all_there=1
-  for b in ${bins//,/ }; do [ -x "$KIT/bin/$b" ] || all_there=0; done
-  if installed "$name" "$ver" && [ $all_there = 1 ]; then return 0; fi
-  say "installing $name $ver"
-  local tmp; tmp=$(mktemp -d)
-  local file="$tmp/${url##*/}"
-  fetch "$url" "$file" || { rm -rf "$tmp"; return 0; }
-  mkdir -p "$tmp/x"
-  if unpack "$file" "$tmp/x"; then
-    for b in ${bins//,/ }; do
-      local found; found=$(find "$tmp/x" -type f -name "$b" | head -1)
-      if [ -n "$found" ]; then install -m 755 "$found" "$KIT/bin/$b"; else warn "$name: '$b' not found in archive"; fi
-    done
-  else
-    install -m 755 "$file" "$KIT/bin/${bins%%,*}"
-  fi
-  rm -rf "$tmp"
-  mark "$name" "$ver"
-}
-
-# --- mise: installs the tools from packages.json --------------------------
-if ! installed mise "$MISE_VERSION" || [ ! -x "$KIT/bin/mise" ]; then
-  say "installing mise $MISE_VERSION"
-  marc=$([ "$ARCH" = x86_64 ] && echo x64 || echo arm64)
-  tmp=$(mktemp -d)
-  fetch "https://github.com/jdx/mise/releases/download/v$MISE_VERSION/mise-v$MISE_VERSION-linux-$marc-musl.tar.gz" "$tmp/mise.tar.gz"
-  tar -xzf "$tmp/mise.tar.gz" -C "$tmp"
-  install -m 755 "$tmp/mise/bin/mise" "$KIT/bin/mise"
-  rm -rf "$tmp"
-  mark mise "$MISE_VERSION"
+umask 077
+KIT="${KIT:-$HOME/.local/kit}"
+P="${KIT_PAYLOAD:-$KIT/payload}"
+MODE=$(cat "$P/mode")
+OS=$(uname -s)
+case "$(uname -m)" in x86_64|amd64) ARCH=x86_64 ;; aarch64|arm64) ARCH=aarch64 ;; *) echo 'kit: unsupported CPU' >&2; exit 1 ;; esac
+say() { printf '› %s\n' "$*"; }
+warn() { printf '! %s\n' "$*" >&2; }
+mkdir -p "$KIT"/{bin,opt,state,cache,share,config/mise}
+# Prevent concurrent pushes from mixing payload/config/package updates.
+lock="$KIT/state/setup.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  owner=$(cat "$lock/pid" 2>/dev/null || true)
+  if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then warn 'another setup is running'; exit 1; fi
+  rm -rf "$lock"; mkdir "$lock"
 fi
-# old kit versions put tools straight into bin/; mise owns them now
-for f in "$KIT"/bin/*; do
-  case "${f##*/}" in mise|kit-shell|fizsh|kit-env) ;; *) rm -f "$f" ;; esac
-done
-rm -f "$KIT"/opt/.versions/{zellij,eza,bat,ripgrep,fd,skim,zoxide,starship,yazi,fzf,ov,mcat,delta,btop,lazygit,uv,diff-so-fancy} 2>/dev/null || true
-
-# --- zsh (static) ----------------------------------------------------------
-if ! installed zsh "$ZSH_BIN_VERSION" || [ ! -x "$KIT/opt/zsh/bin/zsh" ]; then
-  say "installing zsh (zsh-bin $ZSH_BIN_VERSION)"
-  tmp=$(mktemp -d)
-  fetch "https://github.com/romkatv/zsh-bin/releases/download/$ZSH_BIN_VERSION/zsh-5.8-linux-$ARCH.tar.gz" "$tmp/zsh.tar.gz"
-  fetch "https://raw.githubusercontent.com/romkatv/zsh-bin/$ZSH_BIN_VERSION/install" "$tmp/install"
-  rm -rf "$KIT/opt/zsh"
-  sh "$tmp/install" -f "$tmp/zsh.tar.gz" -d "$KIT/opt/zsh" -e no -q
-  rm -rf "$tmp"
-  mark zsh "$ZSH_BIN_VERSION"
+echo $$ > "$lock/pid"
+if [ "$P" != "$KIT/payload" ]; then
+  rm -rf "$KIT/payload.next"
+  cp -R "$P" "$KIT/payload.next"
+  rm -rf "$KIT/payload.old"
+  [ ! -d "$KIT/payload" ] || mv "$KIT/payload" "$KIT/payload.old"
+  mv "$KIT/payload.next" "$KIT/payload"
+  P="$KIT/payload"
 fi
-
-# --- neovim ----------------------------------------------------------------
-if ! installed nvim "$NVIM_VERSION" || [ ! -x "$KIT/opt/nvim/bin/nvim" ]; then
-  say "installing neovim $NVIM_VERSION"
-  narch=$([ "$ARCH" = x86_64 ] && echo x86_64 || echo arm64)
-  tmp=$(mktemp -d)
-  fetch "https://github.com/neovim/neovim-releases/releases/download/v$NVIM_VERSION/nvim-linux-$narch.tar.gz" "$tmp/nvim.tar.gz"
-  rm -rf "$KIT/opt/nvim"; mkdir -p "$KIT/opt/nvim"
-  tar -xzf "$tmp/nvim.tar.gz" -C "$KIT/opt/nvim" --strip-components=1
-  rm -rf "$tmp"
-  mark nvim "$NVIM_VERSION"
-fi
-
-# --- configs, shell files, kitty bits --------------------------------------
-echo "$MODE" > "$KIT/mode"
-if [ "$MODE" = remote ]; then
-  say "syncing configs"
-  # remove only files an earlier push put there and that are gone now; anything else the server
-  # keeps in ~/.local/kit/config (gh login, copilot, ...) stays
-  (cd "$P/config" && find . \( -type f -o -type l \) | LC_ALL=C sort) > "$KIT/state/kit-config.new"
-  if [ -f "$KIT/state/kit-config.list" ]; then
-    LC_ALL=C comm -23 "$KIT/state/kit-config.list" "$KIT/state/kit-config.new" |
-      while IFS= read -r f; do rm -f "$KIT/config/$f"; done
-  fi
-  rm -f "$KIT/config/mise/config.toml"     # generated by older kits; now $KIT/mise.toml
-  rsync -a "$P/config/" "$KIT/config/"
-  mv "$KIT/state/kit-config.new" "$KIT/state/kit-config.list"
-  rsync -a "$P/fizsh/" "$KIT/fizsh/"          # no --delete: keeps history, zcompdump
-fi
-rsync -a --delete "$P/share/" "$KIT/share/"
-install -m 755 "$P/remote/kit-shell" "$KIT/bin/kit-shell"
+tmp=$(mktemp -d); trap 'rm -rf "$tmp" "$lock"' EXIT
+bash "$P/remote/bootstrap.sh"
+for name in kit-env kit-shell; do install -m 755 "$P/remote/$name" "$KIT/bin/$name"; done
 install -m 755 "$P/remote/kit-shell" "$KIT/bin/fizsh"
-install -m 644 "$P/remote/kit-env"   "$KIT/bin/kit-env"
-
-# shellcheck source=/dev/null
+echo "$MODE" > "$KIT/mode"
 . "$KIT/bin/kit-env"
-
-# tools (mise reads $KIT/mise.toml, generated from packages.json)
-say "installing tools"
-: > "$KIT/state/kit-mise.log"
-
-# does a command really run on this machine? (catches "GLIBC_2.xx not found" and friends)
+cd "$KIT"   # do not pick up a project's unrelated mise config
+cp "$P/mise.toml" "$KIT/mise.toml"
+MISE="$KIT/bin/mise"
+"$MISE" trust "$KIT/mise.toml" >/dev/null 2>&1 || true
+fetch() { curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 -o "$2" "$1"; }
+failed=0
+report="$KIT/state/setup-results.tsv"
+printf 'tool\tresult\trecipe\n' > "$report"
+record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$report"; }
+# A failed install is an error even if an older command happens to be on PATH.
+install_spec() { "$MISE" install "$1" >> "$2" 2>&1 && "$MISE" reshim >> "$2" 2>&1; }
 runs() {
   local out rc
   command -v "$1" >/dev/null 2>&1 || return 1
-  out=$("$1" --version 2>&1 </dev/null); rc=$?
-  [ $rc -ne 126 ] && [ $rc -ne 127 ] && ! printf '%s' "$out" | grep -qE 'GLIBC_[0-9]|GLIBCXX|not found \(required|cannot execute|Exec format'
+  local limit
+  limit=$(command -v timeout || command -v gtimeout || true)
+  if [ -n "$limit" ]; then out=$("$limit" 15 "$1" --version </dev/null 2>&1) && rc=0 || rc=$?
+  else out=$("$1" --version </dev/null 2>&1) && rc=0 || rc=$?; fi
+  [ "$rc" -ne 124 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ] && ! printf '%s' "$out" | grep -qE 'GLIBC_[0-9]|GLIBCXX|Exec format|cannot execute|mise ERROR|No version is set for shim'
 }
-
-# Fallbacks for tools whose download can't run on this system (usually: system too old):
-#   1. the same release's musl build (runs on any Linux), found in the project's release list
-#   2. the package's build-from-source recipe (linux_fallback in packages.json)
-# Swaps are remembered per machine, so later pushes go straight to what works here.
-MCONF="$KIT/mise.toml"
-cp "$P/mise.toml" "$MCONF"
-SWAPS="$KIT/state/kit-swaps"
-touch "$SWAPS"
-
-set_tool() {  # replace the config line for tool key $1 with line $2
-  sed -i "s#^\"$1\" = .*#$2#" "$MCONF"
+# Source/package backends need runtimes explicitly; mise does not add them automatically.
+ensure_runtime() {
+  local spec=$1 log=$2 key
+  key=${spec%@*}
+  if grep -qF "\"$key\" = " "$KIT/mise.toml"; then install_spec "$key" "$log"
+  else "$MISE" use --global "$spec" >>"$log" 2>&1 && "$MISE" reshim >>"$log" 2>&1; fi
 }
-apply_swaps() {
-  local key line
-  while IFS=$'\t' read -r key line; do [ -n "$key" ] && set_tool "$key" "$line"; done < "$SWAPS"
+dependency() {
+  local spec=$1 log=$2
+  case "$spec" in
+    cargo:*) ensure_runtime core:rust@stable "$log" ;;
+    npm:*) ensure_runtime core:node@lts "$log" ;;
+    go:*) ensure_runtime core:go@latest "$log" ;;
+    pypi:*) ensure_runtime aqua:astral-sh/uv@latest "$log" && ensure_runtime core:python@3.12 "$log" ;;
+    gem:*) ensure_runtime core:ruby@latest "$log" ;;
+    *) return 0 ;;
+  esac
 }
-remember_swap() {  # key line
-  grep -v "^$1	" "$SWAPS" > "$SWAPS.tmp" || true
-  printf '%s\t%s\n' "$1" "$2" >> "$SWAPS.tmp" && mv "$SWAPS.tmp" "$SWAPS"
+system_install() {
+  local pkg=$1
+  local -a elevate=()
+  if [ "$(id -u)" != 0 ]; then
+    command -v sudo >/dev/null && sudo -n true || { warn "system:$pkg requires administrator access; install it with your distro's package manager, then retry"; return 1; }
+    elevate=(sudo -n)
+  fi
+  if command -v apt-get >/dev/null; then ${elevate[@]+"${elevate[@]}"} apt-get update -qq && ${elevate[@]+"${elevate[@]}"} apt-get install -y "$pkg"
+  elif command -v dnf >/dev/null; then ${elevate[@]+"${elevate[@]}"} dnf install -y "$pkg"
+  elif command -v yum >/dev/null; then ${elevate[@]+"${elevate[@]}"} yum install -y "$pkg"
+  elif command -v apk >/dev/null; then ${elevate[@]+"${elevate[@]}"} apk add "$pkg"
+  elif command -v pacman >/dev/null; then ${elevate[@]+"${elevate[@]}"} pacman -S --needed --noconfirm "$pkg"
+  elif command -v zypper >/dev/null; then ${elevate[@]+"${elevate[@]}"} zypper --non-interactive install "$pkg"
+  else warn "no supported package manager for system:$pkg"; return 1; fi
 }
-mise_sync() {
-  MISE_YES=1 "$KIT/bin/mise" install </dev/null >>"$KIT/state/kit-mise.log" 2>&1 || true
-  "$KIT/bin/mise" reshim >/dev/null 2>&1 || true
+# Install shell independently of the package list. Replace a working installation only after validation.
+if [ "$OS" = Linux ]; then
+  if ! "$KIT/opt/zsh/bin/zsh" -fc true >/dev/null 2>&1; then
+    say 'installing portable zsh'
+    if fetch "https://github.com/romkatv/zsh-bin/releases/download/v6.1.1/zsh-5.8-linux-$ARCH.tar.gz" "$tmp/zsh.tar.gz" \
+       && fetch https://raw.githubusercontent.com/romkatv/zsh-bin/v6.1.1/install "$tmp/install" \
+       && sh "$tmp/install" -f "$tmp/zsh.tar.gz" -d "$tmp/zsh" -e no -q \
+       && "$tmp/zsh/bin/zsh" -fc true; then
+      rm -rf "$KIT/opt/zsh.old"; [ ! -e "$KIT/opt/zsh" ] || mv "$KIT/opt/zsh" "$KIT/opt/zsh.old"
+      mv "$tmp/zsh" "$KIT/opt/zsh"
+    else warn 'portable zsh failed; existing shell preserved'; failed=1; fi
+  fi
+fi
+# Per-package fallback state is keyed by the complete original recipe, including its version.
+swaps="$KIT/state/package-swaps.tsv"; touch "$swaps"
+replace_tool() {
+  local key=$1 line=$2
+  awk -v key="\"$key\" = " -v line="$line" 'index($0,key)==1 {$0=line} {print}' "$KIT/mise.toml" > "$tmp/config"
+  mv "$tmp/config" "$KIT/mise.toml"
 }
 musl_asset() {
-  # the release page lists the files without the API's 60-calls-an-hour limit; the API is the backup
-  local names="" tag
-  for tag in "v$2" "$2"; do
-    names=$(curl -fsSL --connect-timeout 15 </dev/null "https://github.com/$1/releases/expanded_assets/$tag" 2>/dev/null \
-      | grep -oE '/releases/download/[^"]+' | sed 's#.*/##') && [ -n "$names" ] && break
-    names=$(curl -fsSL --connect-timeout 15 </dev/null "https://api.github.com/repos/$1/releases/tags/$tag" 2>/dev/null \
-      | grep -oE '"name": *"[^"]+"' | sed 's/.*"\([^"]*\)"$/\1/') && [ -n "$names" ] && break
+  local repo=$1 version=$2 names tag arch_re
+  if [ "$ARCH" = x86_64 ]; then arch_re='x86_64|amd64|x64'; else arch_re='aarch64|arm64'; fi
+  for tag in "v$version" "$version"; do
+    names=$(curl -fsSL --connect-timeout 15 --max-time 30 "https://github.com/$repo/releases/expanded_assets/$tag" 2>/dev/null |
+      grep -oE '/releases/download/[^" ]+' | sed 's#.*/##') || continue
+    printf '%s\n' "$names" | grep -i musl | grep -iE "$arch_re" | grep -E '^[A-Za-z0-9_.+-]+\.(tar\.gz|tar\.xz|tgz|zip)$' | head -1
+    return
   done
-  printf '%s\n' "$names" | grep -iE "musl" | grep -iE "$ARCH_RE" | grep -E "\.(tar\.gz|tar\.xz|tgz|zip)$" | head -1 || true
 }
-
-apply_swaps
-mise_sync
-while read -r name bin primary fallback <&3; do
+while IFS=$'\t' read -r name bin primary fallback; do
   [ -n "$name" ] || continue
-  runs "$bin" && continue
-  key="${primary%@*}" ver="${primary##*@}"
+  log="$KIT/state/install-$name.log"; : > "$log"
+  # Keep working tools installed outside kit. Updates use their existing provider.
+  case "$primary" in builtin:*|system:*|cmd:*|missing:*) ;; *)
+    existing=$(command -v "$bin" || true)
+    case "$existing" in ""|"$KIT"/*) ;; *)
+      if runs "$bin"; then say "$name: using existing $existing"; record "$name" available "external:$existing"; continue; fi
+      ;; esac
+    ;; esac
+  say "installing $name ($primary)"
   case "$primary" in
-    aqua:*|github:*)
-      repo=$(printf '%s' "${key#*:}" | cut -d/ -f1-2)
-      asset=$(musl_asset "$repo" "$ver")
-      if [ -n "$asset" ]; then
-        say "$name: the download doesn't run on this system, using its musl build ($asset)"
-        "$KIT/bin/mise" uninstall "$primary" "github:$repo@$ver" >/dev/null 2>&1 || true
-        line="\"github:$repo\" = { version = \"$ver\", asset_pattern = \"$asset\" }"
-        set_tool "$key" "$line"
-        mise_sync
-        if runs "$bin"; then remember_swap "$key" "$line"; continue; fi
-      fi ;;
+    missing:*) warn "$name has no recipe for this platform; kit add $name --linux <recipe>"; failed=1; record "$name" missing "$primary"; continue ;;
+    builtin:*)
+      if [ "$primary" = builtin:fizsh ]; then
+        if ! bash "$P/remote/install-fizsh.sh" >>"$log" 2>&1; then
+          warn "$name failed: $log"; failed=1; record "$name" failed "$primary"; continue
+        fi
+      fi
+      if [ "$primary" = builtin:nvim ]; then install_spec aqua:neovim/neovim@0.12.6 "$log" || { failed=1; record "$name" failed "$primary"; continue; }; fi
+      case "${primary#builtin:}" in fizsh) [ -x "$KIT/opt/fizsh/bin/fizsh" ] ;; zsh) runs zsh ;; nvim) runs nvim ;; mise) runs mise ;; *) false ;; esac && record "$name" installed "$primary" || { failed=1; record "$name" failed "$primary"; }
+      continue ;;
+    system:*)
+      if [ "$primary" = system:coreutils ] && [ "$bin" = gtimeout ] && command -v timeout >/dev/null; then ln -sf "$(command -v timeout)" "$KIT/bin/gtimeout"; fi
+      if command -v "$bin" >/dev/null || { system_install "${primary#system:}" >>"$log" 2>&1 && command -v "$bin" >/dev/null; }; then record "$name" installed "$primary"
+      else warn "$name failed: $log"; failed=1; record "$name" failed "$primary"; fi
+      continue ;;
+    cmd:*)
+      script="$P/commands/$name.sh"
+      if grep -q 'uv tool' "$script"; then
+        if ! ensure_runtime aqua:astral-sh/uv@latest "$log" || ! ensure_runtime core:python@3.12 "$log"; then failed=1; record "$name" failed "$primary"; continue; fi
+      fi
+      stamp="$KIT/state/command-$name.sha256"
+      current=$(shasum -a 256 "$script" 2>/dev/null || sha256sum "$script")
+      current=${current%% *}
+      if [ "$(cat "$stamp" 2>/dev/null || true)" = "$current" ] && command -v "$bin" >/dev/null; then record "$name" installed "$primary"; continue; fi
+      if bash "$script" >>"$log" 2>&1 && runs "$bin"; then printf '%s\n' "$current" > "$stamp"; record "$name" installed "$primary"
+      else warn "$name failed: $log"; failed=1; record "$name" failed "$primary"; fi
+      continue ;;
   esac
-  if [ "$fallback" != - ]; then
-    say "$name: building it from source ($fallback, one time, a few minutes)"
-    case "$fallback" in
-      cargo:*) grep -q '^"core:rust"' "$MCONF" || printf '"core:rust" = "stable"\n' >> "$MCONF" ;;
+  effective=$(awk -F '\t' -v spec="$primary" '$1==spec { result=$2 } END {print result}' "$swaps")
+  effective=${effective:-$primary}
+  if [ "$effective" != "$primary" ]; then
+    replace_tool "${primary%@*}" "# selected machine fallback"
+    "$MISE" use --global "$effective" >>"$log" 2>&1 || true
+  fi
+  ok=0
+  if dependency "$effective" "$log" && install_spec "$effective" "$log" && runs "$bin"; then ok=1; fi
+  if [ "$ok" = 0 ] && [ "$OS" = Linux ]; then
+    case "$primary" in
+      aqua:*|github:*)
+        repo=${primary#*:}; repo=${repo%@*}; ver=${primary##*@}
+        asset=$(musl_asset "$repo" "$ver") || asset=""
+        if [ -n "$asset" ]; then
+          candidate="github:${repo}[asset_pattern=$asset]@$ver"
+          say "$name: trying portable musl build"
+          replace_tool "${primary%@*}" "\"github:$repo\" = { version = \"$ver\", asset_pattern = \"$asset\" }"
+          if install_spec "$candidate" "$log" && runs "$bin"; then ok=1; effective=$candidate; fi
+        fi ;;
     esac
-    line="\"${fallback%@*}\" = \"${fallback##*@}\""
-    set_tool "$key" "$line"
-    mise_sync
-    if runs "$bin"; then remember_swap "$key" "$line"; continue; fi
   fi
-  warn "$name: no build of it runs on this system (log: $KIT/state/kit-mise.log)"
-done 3< "$P/packages.list"
-
-# git checkouts the shell needs (externals.json: antidote, ...); on your own machine kit sync does this
-[ "$MODE" = remote ] && while read -r rel url ref; do
-  [ -n "$rel" ] || continue
-  dest="$KIT/fizsh/${rel#.fizsh/}"
-  case "$rel" in .config/*) dest="$KIT/config/${rel#.config/}" ;; esac
-  [ -e "$dest" ] && continue
-  say "cloning $url"
-  git -c advice.detachedHead=false clone -q --depth 1 ${ref:+--branch "$ref"} "$url" "$dest" || warn "clone failed: $url"
-done < "$P/externals.list"
-
-# zellij: pre-grant the stack-cycle plugin (zellij keys this by the plugin's absolute path)
-mkdir -p "$XDG_CACHE_HOME/zellij"
-wasm="$XDG_CONFIG_HOME/zellij/plugins/stack-cycle.wasm"
-perms="$XDG_CACHE_HOME/zellij/permissions.kdl"
-if [ -f "$wasm" ] && ! grep -qF "\"$wasm\"" "$perms" 2>/dev/null; then
-  printf '"%s" {\n    ReadApplicationState\n    ChangeApplicationState\n    RunActionsAsUser\n}\n' "$wasm" >> "$perms"
-fi
-
-# bat: compile the GitHub Dark theme
-bat cache --build >/dev/null 2>&1 || warn "bat cache --build failed"
-
-# shell plugins: let antidote clone/update them now instead of on first login
-say "fetching shell plugins"
-"$KIT/bin/kit-shell" -i -c 'exit' </dev/null >/dev/null 2>&1 || warn "first shell start reported errors"
-
-# ncurses (static, inside the kit) when the system lacks the headers: needed to build cbonsai
-if ! echo '#include <curses.h>' | cc -E - >/dev/null 2>&1 && [ ! -f "$KIT/opt/ncurses/lib/libncursesw.a" ]; then
-  say "building ncurses $NCURSES_VERSION (no system headers, about a minute)"
-  tmp=$(mktemp -d)
-  if fetch "https://ftp.gnu.org/gnu/ncurses/ncurses-$NCURSES_VERSION.tar.gz" "$tmp/nc.tar.gz" \
-     && tar -xzf "$tmp/nc.tar.gz" -C "$tmp" \
-     && (cd "$tmp/ncurses-$NCURSES_VERSION" \
-         && ./configure --prefix="$KIT/opt/ncurses" --enable-widec --without-shared --with-normal \
-              --without-debug --without-ada --without-cxx --without-cxx-binding --without-manpages \
-              --without-progs --without-tests --with-default-terminfo-dir=/usr/share/terminfo \
-              --with-terminfo-dirs="/etc/terminfo:/lib/terminfo:/usr/share/terminfo" \
-         && make -j"$(nproc 2>/dev/null || echo 2)" && make install.libs install.includes) >"$tmp/build.log" 2>&1; then
-    :
-  else
-    warn "ncurses build failed (log: $tmp/build.log); the nvim dashboard tree will be skipped"
+  if [ "$ok" = 0 ] && [ "$fallback" != - ]; then
+    say "$name: trying source fallback $fallback"
+    # Do not retain the primary version in the desired config: it may have a broken shim.
+    replace_tool "${primary%@*}" "# selected source fallback"
+    case "$primary" in aqua:*|github:*) replace_tool "github:$repo" "# selected source fallback" ;; esac
+    "$MISE" use --global "$fallback" >>"$log" 2>&1 || true
+    if dependency "$fallback" "$log" && install_spec "$fallback" "$log" && runs "$bin"; then
+      ok=1; effective=$fallback
+      awk -F '\t' -v spec="$primary" '$1!=spec' "$swaps" > "$tmp/swaps"
+      printf '%s\t%s\n' "$primary" "$fallback" >> "$tmp/swaps"; mv "$tmp/swaps" "$swaps"
+    fi
   fi
-fi
-
-# nvim: plugins, language servers and syntax parsers now, so the first start is clean
-nvim_step() {  # label seconds nvim-args...
-  local label=$1 secs=$2; shift 2
-  say "nvim: $label"
-  timeout "$secs" nvim --headless "$@" +qa >"$KIT/state/kit-nvim-$label.log" 2>&1 \
-    || warn "nvim: $label did not finish in ${secs}s (it continues on first open; log: $KIT/state/kit-nvim-$label.log)"
-}
-nvim_step plugins 600 "+Lazy! restore"
-nvim_step language-servers 900 "+silent! MasonToolsInstallSync"
-# mason ships prebuilt tools too; where one can't run here, point it at the kit's working copy
-for tool in tree-sitter; do
-  mbin="$XDG_DATA_HOME/nvim/mason/bin/$tool"
-  if [ -e "$mbin" ] && ! runs "$mbin" && runs "$tool"; then
-    ln -sfn "$(command -v "$tool")" "$mbin"
-    say "nvim: using the kit's $tool (mason's build can't run on this system)"
-  fi
-done
-nvim_step parsers 600 "+lua pcall(function() require('nvim-treesitter').install(require('astrocore').config.treesitter.ensure_installed):wait(540000) end)"
-[ -x "$KIT/config/nvim/bin/cbonsai.sh" ] && bash "$KIT/config/nvim/bin/cbonsai.sh" --help >/dev/null 2>&1 || true
-
-# --- login hook (servers only; KIT_HOOK=0 on your own Linux machine) ----
-if [ "${KIT_HOOK:-1}" = 1 ]; then bash "$P/remote/hook.sh" install; fi
-
-# --- report: everything that should be here, actually running? ---------------
-failed=""
-total=0
-while read -r name bin primary fallback; do
-  [ -n "$name" ] || continue
-  total=$((total + 1))
-  runs "$bin" || failed="$failed $name"
+  if [ "$ok" = 1 ]; then
+    if [ "$effective" != "$primary" ]; then
+      awk -F '\t' -v spec="$primary" '$1!=spec' "$swaps" > "$tmp/swaps"
+      printf '%s\t%s\n' "$primary" "$effective" >> "$tmp/swaps"; mv "$tmp/swaps" "$swaps"
+    fi
+    record "$name" installed "$effective"
+  else warn "$name failed: $log (compiler/library dependencies may be required for source builds)"; failed=1; record "$name" failed "$effective"; fi
 done < "$P/packages.list"
-for core in zsh nvim; do total=$((total + 1)); runs "$core" || failed="$failed $core"; done
-
-if [ -n "$failed" ]; then
-  warn "$(( total - $(echo $failed | wc -w) ))/$total tools work; NOT working:$failed"
-  warn "logs: $KIT/state/kit-*.log"
-  exit 1
+# All home-relative dotfiles travel, including ~/.zshrc and ~/.gitconfig.
+if [ "$MODE" = remote ]; then bash "$P/remote/deploy.sh" || failed=1; fi
+# External repositories update refs on subsequent pushes as well as first installation.
+while IFS=$'\t' read -r rel url ref; do
+  [ -n "$rel" ] || continue
+  dest="$HOME/$rel"
+  if [ ! -e "$dest" ]; then
+    args=(git clone -q --depth 1); [ -z "$ref" ] || args+=(--branch "$ref")
+    "${args[@]}" -- "$url" "$dest" || { warn "external clone failed: $rel"; failed=1; }
+  elif [ -d "$dest/.git" ] && [ "$(git -C "$dest" config --get remote.origin.url)" != "$url" ]; then
+    warn "external $rel has a different origin; left untouched"; failed=1
+  elif [ -d "$dest/.git" ] && [ -n "$ref" ]; then
+    if ! git -C "$dest" fetch -q --depth 1 origin "$ref" || ! git -C "$dest" checkout -q FETCH_HEAD; then warn "external update failed: $rel"; failed=1; fi
+  elif [ ! -d "$dest/.git" ]; then warn "external path already exists: $rel"; failed=1; fi
+done < "$P/externals.list"
+cp -R "$P/share/." "$KIT/share/"
+# Set up the shell even on a new account without ~/.bashrc; tracked rc files are safe to hook.
+bash "$P/remote/hook.sh" install || failed=1
+# Warm owned shell/editor configuration before the first login. Optional failures have logs.
+command -v bat >/dev/null && bat cache --build >/dev/null 2>&1 || true
+LIMIT=$(command -v timeout || command -v gtimeout || true)
+if [ -n "$LIMIT" ] && [ -f "$ZDOTDIR/.zshrc" ]; then
+  say 'warming shell configuration'
+  "$LIMIT" 180 "$KIT/bin/kit-shell" -i -c exit </dev/null > "$KIT/state/shell-init.log" 2>&1 \
+    || warn 'shell configuration needs attention (state/shell-init.log)'
 fi
-cat "$P/.stamp" > "$KIT/.stamp"   # only after everything works: the next run can skip this setup
-if [ "$MODE" = remote ]; then say "all $total tools work — next ssh login drops you into your environment"
-else say "all $total tools work"; fi
+if [ -f "$HOME/.config/nvim/lazy-lock.json" ] && [ -n "$LIMIT" ]; then
+  say 'warming editor plugins and language tools'
+  "$LIMIT" 300 nvim --headless '+Lazy! restore' +qa > "$KIT/state/nvim-plugins.log" 2>&1 || warn 'nvim plugins need attention (state/nvim-plugins.log)'
+  "$LIMIT" 300 nvim --headless '+silent! MasonToolsInstallSync' +qa > "$KIT/state/nvim-language-tools.log" 2>&1 || warn 'nvim language tools need attention (state/nvim-language-tools.log)'
+  "$LIMIT" 300 nvim --headless "+lua pcall(function() local c=require('astrocore').config.treesitter; require('nvim-treesitter').install(c.ensure_installed):wait(240000) end)" +qa > "$KIT/state/nvim-parsers.log" 2>&1 || warn 'nvim parsers need attention (state/nvim-parsers.log)'
+fi
+if ! "$KIT/bin/kit-shell" --ok; then warn 'kit shell cannot start'; failed=1; fi
+if [ "$failed" = 0 ]; then cp "$P/.stamp" "$KIT/.stamp"; say 'environment ready'
+else warn "setup incomplete; results: $report. Retry kit sync / kit push after correcting failures."; fi
+exit "$failed"

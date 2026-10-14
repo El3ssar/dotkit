@@ -3,12 +3,12 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -61,9 +61,10 @@ pub fn ctx() -> &'static Ctx {
         };
         let state = match env_nonempty("KIT_STATE") {
             Some(s) => PathBuf::from(s),
-            None => PathBuf::from(env_nonempty("XDG_STATE_HOME").unwrap_or_else(|| {
-                home.join(".local/state").to_string_lossy().into_owned()
-            }))
+            None => PathBuf::from(
+                env_nonempty("XDG_STATE_HOME")
+                    .unwrap_or_else(|| home.join(".local/state").to_string_lossy().into_owned()),
+            )
             .join("kit"),
         };
         let is_mac = cfg!(target_os = "macos");
@@ -186,7 +187,9 @@ pub fn run_full<S: AsRef<OsStr>>(
     env: Option<&[(String, String)]>,
     input: Option<&str>,
 ) -> Out {
-    let mut c = Command::new(&cmd[0]);
+    let program = cmd[0].as_ref();
+    let resolved = program.to_str().and_then(which);
+    let mut c = Command::new(resolved.as_deref().map(Path::as_os_str).unwrap_or(program));
     c.args(&cmd[1..]);
     if let Some(d) = cwd {
         c.current_dir(d);
@@ -208,7 +211,11 @@ pub fn run_full<S: AsRef<OsStr>>(
         Ok(ch) => ch,
         Err(_) => {
             let name = cmd[0].as_ref().to_string_lossy().into_owned();
-            return Out { code: 127, stdout: String::new(), stderr: format!("{name}: not installed") };
+            return Out {
+                code: 127,
+                stdout: String::new(),
+                stderr: format!("{name}: not installed"),
+            };
         }
     };
     if let Some(text) = input {
@@ -222,7 +229,11 @@ pub fn run_full<S: AsRef<OsStr>>(
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
         },
-        Err(_) => Out { code: 1, stdout: String::new(), stderr: String::new() },
+        Err(_) => Out {
+            code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
     }
 }
 
@@ -230,12 +241,26 @@ pub fn run_full<S: AsRef<OsStr>>(
 pub fn run_check<S: AsRef<OsStr>>(cmd: &[S], capture: bool) -> Out {
     let r = run(cmd, capture);
     if r.code == 127 && r.stderr.ends_with("not installed") {
-        die(&format!("{} is not installed (kit doctor)", cmd[0].as_ref().to_string_lossy()));
+        die(&format!(
+            "{} is not installed; install it and retry",
+            cmd[0].as_ref().to_string_lossy()
+        ));
     }
     if r.code != 0 {
-        let detail = if capture && !r.stderr.trim().is_empty() { format!("\n{}", r.stderr.trim()) } else { String::new() };
-        let shown: Vec<String> = cmd.iter().map(|s| s.as_ref().to_string_lossy().into_owned()).collect();
-        die(&format!("command failed ({}): {}{detail}", r.code, shown.join(" ")));
+        let detail = if capture && !r.stderr.trim().is_empty() {
+            format!("\n{}", r.stderr.trim())
+        } else {
+            String::new()
+        };
+        let shown: Vec<String> = cmd
+            .iter()
+            .map(|s| s.as_ref().to_string_lossy().into_owned())
+            .collect();
+        die(&format!(
+            "command failed ({}): {}{detail}",
+            r.code,
+            shown.join(" ")
+        ));
     }
     r
 }
@@ -245,12 +270,22 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         let p = PathBuf::from(cmd);
         return is_executable(&p).then_some(p);
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join(cmd)).find(|p| is_executable(p))
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|d| d.join(cmd))
+        .chain(std::env::var_os("CARGO_HOME").map(|home| PathBuf::from(home).join("bin").join(cmd)))
+        .chain([
+            ctx().home.join(".local/kit/bin").join(cmd),
+            ctx().home.join(".local/kit/mise/shims").join(cmd),
+            ctx().home.join(".cargo/bin").join(cmd),
+        ])
+        .find(|p| is_executable(p))
 }
 
 pub fn is_executable(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 pub fn have(cmd: &str) -> bool {
@@ -273,24 +308,45 @@ pub fn git_check(args: &[&str]) -> Out {
 
 // --------------------------------------------------------------------------- files
 fn tmp_for(dest: &Path) -> PathBuf {
-    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    dest.with_file_name(format!(".{name}.kit-tmp"))
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(
+        ".{name}.kit-tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 pub fn write_atomic(dest: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     let tmp = tmp_for(dest);
-    fs::write(&tmp, data)?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&tmp, dest)
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let result = (|| {
+        file.write_all(data)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        fs::rename(&tmp, dest)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn link_atomic(dest: &Path, target: &str) -> std::io::Result<()> {
     let tmp = tmp_for(dest);
-    if fs::symlink_metadata(&tmp).is_ok() {
-        fs::remove_file(&tmp)?;
-    }
     std::os::unix::fs::symlink(target, &tmp)?;
-    fs::rename(&tmp, dest)
+    let result = fs::rename(&tmp, dest);
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub fn exists_or_link(p: &Path) -> bool {
@@ -298,7 +354,9 @@ pub fn exists_or_link(p: &Path) -> bool {
 }
 
 pub fn is_link(p: &Path) -> bool {
-    fs::symlink_metadata(p).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+    fs::symlink_metadata(p)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 pub fn is_real_dir(p: &Path) -> bool {
@@ -307,11 +365,12 @@ pub fn is_real_dir(p: &Path) -> bool {
 
 pub fn load_json(path: &Path, default: Value) -> Value {
     match fs::read_to_string(path) {
-        Err(_) => default,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default,
+        Err(e) => die(&format!("could not read {}: {e}", path.display())),
         Ok(text) => match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(e) => die(&format!(
-                "{} is not valid JSON (line {}: {}). A merge conflict? Fix it with `kit cd`, then try again.",
+                "{} is not valid JSON (line {}: {}). A merge conflict? Fix this file in the repo, then try again.",
                 path.file_name().unwrap_or_default().to_string_lossy(),
                 e.line(),
                 e
@@ -323,14 +382,27 @@ pub fn load_json(path: &Path, default: Value) -> Value {
 pub fn load_obj(path: &Path) -> serde_json::Map<String, Value> {
     match load_json(path, Value::Object(Default::default())) {
         Value::Object(m) => m,
-        _ => die(&format!("{} must contain a JSON object", path.file_name().unwrap_or_default().to_string_lossy())),
+        _ => die(&format!(
+            "{} must contain a JSON object",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
     }
 }
 
 pub fn load_str_list(path: &Path) -> Vec<String> {
     match load_json(path, Value::Array(vec![])) {
-        Value::Array(a) => a.into_iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-        _ => die(&format!("{} must contain a JSON list", path.file_name().unwrap_or_default().to_string_lossy())),
+        Value::Array(a) => a
+            .into_iter()
+            .map(|v| {
+                v.as_str().map(String::from).unwrap_or_else(|| {
+                    die(&format!("{} must contain only strings", path.display()))
+                })
+            })
+            .collect(),
+        _ => die(&format!(
+            "{} must contain a JSON list",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )),
     }
 }
 
@@ -372,12 +444,9 @@ pub fn norm(rel: &str) -> String {
 
 pub fn under(rel: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
-    prefix.is_empty() || rel == prefix || (rel.starts_with(prefix) && rel[prefix.len()..].starts_with('/'))
-}
-
-pub fn nfc(s: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    s.nfc().collect()
+    prefix.is_empty()
+        || rel == prefix
+        || (rel.starts_with(prefix) && rel[prefix.len()..].starts_with('/'))
 }
 
 pub fn path_str(p: &Path) -> String {
@@ -439,7 +508,11 @@ fn translate(pat: &str, in_folder: bool) -> String {
                     } else if stuff.starts_with('^') {
                         stuff = format!("\\{stuff}");
                     }
-                    stuff = stuff.replace('[', "\\[").replace("&&", "\\&\\&").replace("~~", "\\~\\~").replace("--", "\\-\\-");
+                    stuff = stuff
+                        .replace('[', "\\[")
+                        .replace("&&", "\\&\\&")
+                        .replace("~~", "\\~\\~")
+                        .replace("--", "\\-\\-");
                     if stuff.is_empty() {
                         res.push_str("(?!)");
                     } else {
@@ -461,7 +534,8 @@ pub fn fnmatch(name: &str, pat: &str) -> bool {
     let cache = FNMATCH.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().unwrap();
     if !cache.contains_key(pat) {
-        let re = Regex::new(&translate(pat, false)).unwrap_or_else(|_| Regex::new(&format!("^{}$", regex::escape(pat))).unwrap());
+        let re = Regex::new(&translate(pat, false))
+            .unwrap_or_else(|_| Regex::new(&format!("^{}$", regex::escape(pat))).unwrap());
         cache.insert(pat.to_string(), re);
     }
     cache[pat].is_match(name)
@@ -490,7 +564,8 @@ pub fn pathmatch(path: &str, pat: &str) -> bool {
             }
         }
         res.push('$');
-        let re = Regex::new(&res).unwrap_or_else(|_| Regex::new(&format!("^{}$", regex::escape(pat))).unwrap());
+        let re = Regex::new(&res)
+            .unwrap_or_else(|_| Regex::new(&format!("^{}$", regex::escape(pat))).unwrap());
         cache.insert(pat.to_string(), re);
     }
     cache[pat].is_match(path)
@@ -521,8 +596,39 @@ pub fn now_stamp() -> String {
         stamp = format!("{base}{n}");
         n += 1;
     }
-    let _ = std::fs::create_dir_all(backups.join(&stamp)); // reserve it
+    std::fs::create_dir_all(backups.join(&stamp))
+        .unwrap_or_else(|e| die(&format!("cannot create backup folder: {e}")));
     stamp
+}
+
+/// Serialize commands that update the same repo or machine state. flock releases on exit.
+pub fn lock_workspace() -> Vec<fs::File> {
+    use std::os::fd::AsRawFd;
+    let cx = ctx();
+    fs::create_dir_all(&cx.state)
+        .unwrap_or_else(|e| die(&format!("cannot create state directory: {e}")));
+    let mut paths = vec![cx.state.join("lock")];
+    if cx.source.join(".git").is_dir() {
+        paths.insert(0, cx.source.join(".git/kit.lock"));
+    }
+    paths
+        .into_iter()
+        .map(|p| {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&p)
+                .unwrap_or_else(|e| die(&format!("cannot open lock {}: {e}", p.display())));
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                die("another kit command is running; wait for it to finish");
+            }
+            f
+        })
+        .collect()
 }
 
 /// Drop a reserved backup folder that ended up empty.

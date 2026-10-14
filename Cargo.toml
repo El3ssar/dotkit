@@ -1,8 +1,8 @@
 [package]
 name = "dotkit"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 description = "Your dotfiles and tools, the same on every machine: track them in git, sync and merge between machines, and put your shell on servers over ssh"
 license = "MIT"
 repository = "https://github.com/El3ssar/dotkit"
@@ -26,7 +26,9 @@ regex = "1"
 similar = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
-unicode-normalization = "0.1"
+ratatui = "0.29.0"
+crossterm = "0.28.1"
+semver = "1"
 
 [profile.release]
 opt-level = 3

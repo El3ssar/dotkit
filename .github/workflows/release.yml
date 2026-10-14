@@ -17,6 +17,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: check release version
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1']))
+          version = metadata['packages'][0]['version']
+          if os.environ['GITHUB_REF_NAME'] != 'v' + version:
+              raise SystemExit('Release tag must match Cargo.toml version ' + version)
+          PY
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -35,9 +44,28 @@ jobs:
           tar -czf ../../../kit-${{ matrix.target }}.tar.gz kit
           cd ../../..
           shasum -a 256 kit-${{ matrix.target }}.tar.gz > kit-${{ matrix.target }}.tar.gz.sha256
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
+          name: kit-${{ matrix.target }}
+          path: |
             kit-${{ matrix.target }}.tar.gz
             kit-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kit-*
+          merge-multiple: true
+          path: release
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release/*.tar.gz
+            release/*.tar.gz.sha256
+          fail_on_unmatched_files: true

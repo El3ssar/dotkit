@@ -1,7 +1,7 @@
 //! The commands: init, add, rm, status, save, sync, undo (push lives in remote.rs).
 use crate::cli::Args;
 use crate::core::*;
-use crate::pkg::{all_packages, pkg_installed, pkg_spec};
+use crate::pkg::{all_packages, pkg_available, pkg_spec};
 use crate::scripts::{run_scripts, script_status};
 use crate::util::*;
 use serde_json::Value;
@@ -16,18 +16,29 @@ pub fn cmd_init(a: &Args) {
     if cx.source.join(".git").exists() {
         match url {
             Some(u) => {
-                let set = if remote_url().is_empty() { git(&["remote", "add", "origin", &u]) } else { git(&["remote", "set-url", "origin", &u]) };
+                let set = if remote_url().is_empty() {
+                    git(&["remote", "add", "origin", &u])
+                } else {
+                    git(&["remote", "set-url", "origin", &u])
+                };
                 if set.code != 0 {
-                    die(&format!("could not set the backup repo: {}", set.stderr.trim()));
+                    die(&format!(
+                        "could not set the backup repo: {}",
+                        set.stderr.trim()
+                    ));
                 }
                 say(&format!("backup: {u} — kit sync to back up"));
             }
-            None => say(&format!("kit repo already at {} — kit init <url> sets where it's backed up", tilde(&cx.source))),
+            None => say(&format!(
+                "kit repo already at {} — kit init <url> sets where it's backed up",
+                tilde(&cx.source)
+            )),
         }
         return;
     }
     if let Some(repo) = url {
         run_check(&["git", "clone", "-q", &repo, &path_str(&cx.source)], false);
+        queue_cloned_code();
         say(&format!("cloned {repo} — kit status to see what it would change here, kit sync to set this machine up"));
         return;
     }
@@ -84,11 +95,13 @@ pub fn add_one(rel: &str, force: bool, synced: &mut Synced, quiet_ignored: bool)
         fail(&e);
         return 0;
     }
-    let e = read_entry(&ctx().home.join(rel));
+    let e = read_home_entry(rel);
     match &e {
         None | Some(Entry::Dir) => return 0,
         Some(Entry::Other) => {
-            warn(&format!("skipped ~/{rel}: not a regular file (pipe/socket/device)"));
+            warn(&format!(
+                "skipped ~/{rel}: not a regular file (pipe/socket/device)"
+            ));
             return 0;
         }
         Some(Entry::Unreadable) => {
@@ -104,7 +117,10 @@ pub fn add_one(rel: &str, force: bool, synced: &mut Synced, quiet_ignored: bool)
         }
     }
     if ctx().tree.join(rel).exists() && !rules_for(rel, &local_contexts()).is_empty() {
-        warn(&format!("~/{rel} has {} rules; edit the repo's copy instead (~/.local/share/kit/home)", ctx().platform));
+        warn(&format!(
+            "~/{rel} has {} rules; edit the repo's copy instead (~/.local/share/kit/home)",
+            ctx().platform
+        ));
         return 0;
     }
     if let Some(Entry::Link(t)) = &e {
@@ -116,6 +132,10 @@ pub fn add_one(rel: &str, force: bool, synced: &mut Synced, quiet_ignored: bool)
     if let Err(err) = write_tree(rel, &e) {
         fail(&format!("could not store ~/{rel}: {err}"));
         return 0;
+    }
+    if force {
+        allow_secret(rel, &e);
+        unignore_exact(rel);
     }
     mark_synced(synced, rel, &e);
     1
@@ -147,7 +167,9 @@ fn add_files(paths: &[String], force: bool, no_servers: bool) {
         if is_real_dir(&target) {
             if ignored_here(&rel) && !force {
                 if let Some((n, pat)) = ignore_match(&rel, &local_contexts()) {
-                    fail(&format!("skipped ~/{rel}: matches .kitignore line {n} ('{pat}')"));
+                    fail(&format!(
+                        "skipped ~/{rel}: matches .kitignore line {n} ('{pat}')"
+                    ));
                 }
                 continue;
             }
@@ -159,13 +181,17 @@ fn add_files(paths: &[String], force: bool, no_servers: bool) {
                 dirs.push(rel.clone());
             }
             let mut entries = Vec::new();
-            walk_entries(&target, &rel, &mut entries, &mut |drel, _| ignored_here(drel) || contains_kit(drel));
+            walk_entries(&target, &rel, &mut entries, &mut |drel, _| {
+                (!force && ignored_here(drel)) || contains_kit(drel)
+            });
             let mut n = 0;
             for e in entries {
                 n += add_one(&e, force, &mut synced, true);
             }
             if n > 500 {
-                warn(&format!("~/{rel} added {n} files — sure that's all config? (kit rm ~/{rel} to undo)"));
+                warn(&format!(
+                    "~/{rel} added {n} files — sure that's all config? (kit rm ~/{rel} to undo)"
+                ));
             }
             count += n;
         } else {
@@ -182,17 +208,26 @@ fn add_files(paths: &[String], force: bool, no_servers: bool) {
         note("kept off servers ([remote] in .kitignore)");
     }
     if !tops.is_empty() {
-        say(&format!("tracking {count} file(s){}", if count > 0 { " — kit sync to back them up" } else { "" }));
+        say(&format!(
+            "tracking {count} file(s){}",
+            if count > 0 {
+                " — kit sync to back them up"
+            } else {
+                ""
+            }
+        ));
     }
 }
 
 pub fn cmd_add(a: &Args) {
     guard_repo();
-    let (files, tools): (Vec<String>, Vec<String>) = a.many("paths").into_iter().partition(|p| is_path_arg(p));
+    let (files, tools): (Vec<String>, Vec<String>) =
+        a.many("paths").into_iter().partition(|p| is_path_arg(p));
     if !files.is_empty() {
         add_files(&files, a.flag("force"), a.flag("no_servers"));
     }
     if !tools.is_empty() {
+        crate::remote::ensure_mise();
         crate::pkg::add_tools(&tools, a);
     }
 }
@@ -217,15 +252,14 @@ pub fn cmd_rm(a: &Args) {
         let victims = managed(Some(std::slice::from_ref(&rel)));
         let inside_tracked = dirs.iter().any(|d| under(&rel, d) && &rel != d);
         if victims.is_empty() {
-            if inside_tracked {
-                add_ignore(std::slice::from_ref(&rel), "all", "forgotten");
-                say(&format!("~/{rel} won't show up as new anymore"));
-            } else {
-                fail(&format!("~/{rel} is not tracked"));
-            }
+            fail(&format!("~/{rel} is not tracked"));
             continue;
         }
-        let in_git = cx.source.join(".git").exists() && !git(&["ls-files", "--", &format!("home/{rel}")]).stdout.trim().is_empty();
+        let in_git = cx.source.join(".git").exists()
+            && !git(&["ls-files", "--", &format!("home/{rel}")])
+                .stdout
+                .trim()
+                .is_empty();
         for v in &victims {
             if let Err(e) = remove_tree(v) {
                 fail(&e);
@@ -236,7 +270,10 @@ pub fn cmd_rm(a: &Args) {
         if inside_tracked {
             add_ignore(std::slice::from_ref(&rel), "all", "forgotten");
         }
-        say(&format!("stopped tracking ~/{rel} ({} file(s); the files on this machine are untouched)", victims.len()));
+        say(&format!(
+            "stopped tracking ~/{rel} ({} file(s); the files on this machine are untouched)",
+            victims.len()
+        ));
         if in_git {
             note("it stays in the repo's git history");
         }
@@ -279,12 +316,11 @@ pub fn group_rows(rows: &[(&'static str, String)], verbose: bool) -> Vec<(&'stat
 }
 
 const HINTS: &[(&[&str], &str)] = &[
-    (&["here", "new", "deleted"], "keep this machine's version → kit save"),
+    (&["here", "deleted"], "keep this machine's version → kit save"),
     (&["repo", "missing"], "get the repo's version → kit sync"),
     (&["both"], "changed on both → kit sync merges them (or: kit save --force keeps yours, kit undo <file> takes the repo's)"),
     (&["conflict"], "conflicts → edit the file, keep what you want between <<<<<<< and >>>>>>>, then kit save (or kit undo <file>)"),
     (&["type"], "file vs folder → kit rm it, then kit add it again"),
-    (&["new"], "don't want a new file? → kit rm <file>"),
 ];
 
 /// [(rel, git url, ref, state)] state: ok | missing | stale
@@ -292,15 +328,49 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
     let cx = ctx();
     let mut out = Vec::new();
     for (rel, spec) in load_obj(&cx.externals) {
-        let rel = norm(&rel);
-        if rel.starts_with("..") || rel.starts_with('/') {
-            continue;
+        validate_rel(&rel).unwrap_or_else(|e| die(&format!("externals.json: {e}")));
+        if never_track(&rel) {
+            die("externals.json cannot target kit's own folders");
         }
-        let url = spec.get("git").and_then(Value::as_str).unwrap_or("").to_string();
+        let url = spec
+            .get("git")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let r#ref = spec.get("ref").and_then(Value::as_str).map(String::from);
         let dest = cx.home.join(&rel);
         if !dest.exists() {
             out.push((rel, url, r#ref, "missing"));
+            continue;
+        }
+        let origin = run(
+            &[
+                "git",
+                "-C",
+                &path_str(&dest),
+                "config",
+                "--get",
+                "remote.origin.url",
+            ],
+            true,
+        );
+        if origin.code == 0
+            && origin
+                .stdout
+                .trim()
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                != url.trim_end_matches('/').trim_end_matches(".git")
+        {
+            fail(&format!(
+                "external ~/{rel} has a different origin; left untouched"
+            ));
+            continue;
+        }
+        if !dest.join(".git").exists() {
+            fail(&format!(
+                "external ~/{rel} exists but is not a git checkout"
+            ));
             continue;
         }
         let mut state = "ok";
@@ -312,9 +382,15 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
                     cmd.extend_from_slice(args);
                     run(&cmd, true)
                 };
-                let tag = g(&["describe", "--tags", "--exact-match", "HEAD"]).stdout.trim().to_string();
+                let tag = g(&["describe", "--tags", "--exact-match", "HEAD"])
+                    .stdout
+                    .trim()
+                    .to_string();
                 let head = g(&["rev-parse", "HEAD"]).stdout.trim().to_string();
-                let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim().to_string();
+                let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"])
+                    .stdout
+                    .trim()
+                    .to_string();
                 let newer = g(&["merge-base", "--is-ancestor", r, "HEAD"]).code == 0;
                 if r != &tag && r != &branch && !head.starts_with(r.as_str()) && !newer {
                     state = "stale";
@@ -329,7 +405,6 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
 fn color_for(code: &str) -> &'static str {
     match code {
         "here" | "deleted" => "33",
-        "new" => "35",
         "repo" | "missing" => "36",
         _ => "31",
     }
@@ -354,6 +429,218 @@ fn missing_tools() -> Vec<String> {
     out
 }
 
+/// Git paths waiting to be committed, without Git's quoting or directory collapsing.
+fn saved_changes() -> Vec<(String, String)> {
+    let status = git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    let mut records = status.stdout.split('\0').filter(|s| !s.is_empty());
+    let mut changes = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let code = &record[..2];
+        let path = &record[3..];
+        if code.contains('R') || code.contains('C') {
+            if let Some(old) = records.next() {
+                if code.contains('R') {
+                    changes.push(("deleted".into(), old.into()));
+                }
+            }
+            changes.push(("added".into(), path.into()));
+            continue;
+        }
+        let action = if code.contains('U') || code == "AA" || code == "DD" {
+            "conflict"
+        } else if code.contains('D') {
+            "deleted"
+        } else if code.contains('A') || code == "??" {
+            "added"
+        } else {
+            "changed"
+        };
+        changes.push((action.into(), path.into()));
+    }
+    changes.extend(
+        hidden_by_gitignore()
+            .into_iter()
+            .map(|p| ("added".into(), format!("home/{p}"))),
+    );
+    changes.sort();
+    changes.dedup();
+    changes
+}
+
+fn revision_packages(revision: &str) -> serde_json::Map<String, Value> {
+    let result = git(&["show", &format!("{revision}:packages.json")]);
+    serde_json::from_str::<Value>(&result.stdout)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn pending_rows(
+    changes: &[(String, String)],
+    before: &str,
+    after: Option<&str>,
+    prefixes: Option<&[String]>,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    for (action, path) in changes {
+        if let Some(ps) = prefixes {
+            if !path
+                .strip_prefix("home/")
+                .is_some_and(|rel| ps.iter().any(|p| under(rel, p)))
+            {
+                continue;
+            }
+        }
+        if path == "packages.json" {
+            let old = revision_packages(before);
+            let new = after
+                .map(revision_packages)
+                .unwrap_or_else(|| load_obj(&ctx().pkgs));
+            let mut names: Vec<&String> = old.keys().chain(new.keys()).collect();
+            names.sort();
+            names.dedup();
+            let initial = rows.len();
+            for name in names {
+                if old.get(name) == new.get(name) {
+                    continue;
+                }
+                let action = if !old.contains_key(name) {
+                    "added"
+                } else if !new.contains_key(name) {
+                    "removed"
+                } else {
+                    "updated"
+                };
+                let fields: Vec<&str> = [
+                    "mac",
+                    "linux",
+                    "linux_fallback",
+                    "bin",
+                    "linux_bin",
+                    "remote",
+                ]
+                .into_iter()
+                .filter(|field| {
+                    old.get(name).and_then(|p| p.get(*field))
+                        != new.get(name).and_then(|p| p.get(*field))
+                })
+                .collect();
+                let detail = if action == "updated" && !fields.is_empty() {
+                    format!(" ({})", fields.join(", "))
+                } else {
+                    String::new()
+                };
+                rows.push(format!("{action:16} package {name}{detail}"));
+            }
+            if rows.len() != initial {
+                continue;
+            }
+        }
+        let shown = path
+            .strip_prefix("home/")
+            .map(|p| format!("~/{p}"))
+            .unwrap_or_else(|| path.clone());
+        let shown = if shown.chars().any(char::is_control) {
+            format!("{shown:?}")
+        } else {
+            shown
+        };
+        rows.push(format!("{action:16} {shown}"));
+    }
+    rows
+}
+
+fn committed_changes(before: &str, after: &str) -> Vec<(String, String)> {
+    let diff = git(&["diff", "--name-status", "--no-renames", "-z", before, after]);
+    let mut fields = diff.stdout.split('\0').filter(|s| !s.is_empty());
+    let mut changes = Vec::new();
+    while let (Some(code), Some(path)) = (fields.next(), fields.next()) {
+        changes.push((
+            match code {
+                "A" => "added",
+                "D" => "deleted",
+                _ => "changed",
+            }
+            .into(),
+            path.into(),
+        ));
+    }
+    changes
+}
+
+/// Show saved work and both directions of changes since the last fetched upstream state.
+fn show_pending_changes(prefixes: Option<&[String]>) -> bool {
+    if !ctx().source.join(".git").exists() {
+        return false;
+    }
+    let rows = pending_rows(&saved_changes(), "HEAD", None, prefixes);
+    let mut pending = !rows.is_empty();
+    if pending {
+        out(&format!(
+            "Saved, not backed up yet:{}",
+            c("2", "   → kit sync")
+        ));
+        for row in rows {
+            out(&format!("  {row}"));
+        }
+    }
+    if git(&["rev-parse", "--verify", "@{u}"]).code == 0 {
+        let result = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"]);
+        let counts: Vec<&str> = result.stdout.split_whitespace().collect();
+        if counts.len() == 2 && (counts[0] != "0" || counts[1] != "0") {
+            let base = git(&["merge-base", "HEAD", "@{u}"]);
+            let base = if base.code == 0 {
+                base.stdout.trim()
+            } else {
+                "@{u}"
+            };
+            let outgoing = if counts[0] != "0" {
+                pending_rows(
+                    &committed_changes(base, "HEAD"),
+                    base,
+                    Some("HEAD"),
+                    prefixes,
+                )
+            } else {
+                vec![]
+            };
+            let incoming = if counts[1] != "0" {
+                pending_rows(
+                    &committed_changes(base, "@{u}"),
+                    base,
+                    Some("@{u}"),
+                    prefixes,
+                )
+            } else {
+                vec![]
+            };
+            if prefixes.is_none() || !outgoing.is_empty() || !incoming.is_empty() {
+                pending = true;
+                out(&format!(
+                    "Repo: {} commit(s) to send, {} to get{}",
+                    counts[0],
+                    counts[1],
+                    c("2", "   → kit sync")
+                ));
+                for (heading, rows) in
+                    [("To send:", outgoing), ("To get (last fetched):", incoming)]
+                {
+                    if !rows.is_empty() {
+                        out(&format!("  {heading}"));
+                        for row in rows {
+                            out(&format!("    {row}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pending
+}
+
 pub fn cmd_status(a: &Args) {
     let cx = ctx();
     let prefixes = scope(&a.many("paths"));
@@ -363,7 +650,10 @@ pub fn cmd_status(a: &Args) {
         out("Files (this machine vs the repo):");
         let rows = group_rows(&changes, a.flag("verbose") || prefixes.is_some());
         for (code, shown) in &rows {
-            out(&format!("  {} {shown}", c(color_for(code), &format!("{:16}", label(code)))));
+            out(&format!(
+                "  {} {shown}",
+                c(color_for(code), &format!("{:16}", label(code)))
+            ));
         }
         for (codes, hint) in HINTS {
             if changes.iter().any(|(c, _)| codes.contains(c)) {
@@ -371,12 +661,16 @@ pub fn cmd_status(a: &Args) {
             }
         }
         if rows.len() < changes.len() {
-            out(&c("2", "  kit status -v lists every file · kit status <file> shows its diff"));
+            out(&c(
+                "2",
+                "  kit status -v lists every file · kit status <file> shows its diff",
+            ));
         }
     }
     if prefixes.is_some() {
+        let pending = show_pending_changes(prefixes.as_deref());
         if changes.is_empty() {
-            if exit_code() == 0 {
+            if exit_code() == 0 && !pending {
                 say("in sync");
             }
             return;
@@ -384,8 +678,15 @@ pub fn cmd_status(a: &Args) {
         let mut patch = String::new();
         for (code, rel) in &changes {
             let tgt = read_entry(&cx.home.join(rel));
-            let src = if *code == "new" { None } else { source_entry(rel, &local_contexts()).ok().flatten() };
-            patch += &crate::diff::diff_text(rel, src.as_ref(), tgt.as_ref(), "repo", "this machine", label(code));
+            let src = source_entry(rel, &local_contexts()).ok().flatten();
+            patch += &crate::diff::diff_text(
+                rel,
+                src.as_ref(),
+                tgt.as_ref(),
+                "repo",
+                "this machine",
+                label(code),
+            );
         }
         out("");
         crate::diff::show_patch(&patch, false, true);
@@ -397,16 +698,47 @@ pub fn cmd_status(a: &Args) {
         problems = true;
         out(&c("33", &format!("Missing: {}", missing.join(" · "))));
     }
-    let pk: Vec<String> = all_packages().into_iter().filter(|(n, p)| pkg_spec(p).is_some() && !pkg_installed(n, p)).map(|(n, _)| n).collect();
+    {
+        let missing: Vec<String> = all_packages()
+            .into_iter()
+            .filter(|(_, p)| {
+                p.get("linux").is_none()
+                    && p.get("mac")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.starts_with("cask:"))
+            })
+            .map(|(n, _)| n)
+            .collect();
+        if !missing.is_empty() {
+            problems = true;
+            out(&format!("Tools without Linux recipes: {} (kit packages resolve generates them; kit add <tool> --linux <recipe> overrides)", missing.join(", ")));
+        }
+    }
+    let pk: Vec<String> = all_packages()
+        .into_iter()
+        .filter(|(n, p)| pkg_spec(p).is_some() && !pkg_available(n, p))
+        .map(|(n, _)| n)
+        .collect();
     if !pk.is_empty() {
         problems = true;
-        out(&format!("Tools not installed here: {}{}", pk.join(", "), c("2", "   → kit sync")));
+        out(&format!(
+            "Tools not installed here: {}{}",
+            pk.join(", "),
+            c("2", "   → kit sync")
+        ));
     }
     for (rel, _, r#ref, state) in externals_state() {
         if state != "ok" {
             problems = true;
-            let what = if state == "missing" { "missing".to_string() } else { format!("not at {}", r#ref.unwrap_or_default()) };
-            out(&format!("External ~/{rel}: {what}{}", c("2", "   → kit sync")));
+            let what = if state == "missing" {
+                "missing".to_string()
+            } else {
+                format!("not at {}", r#ref.unwrap_or_default())
+            };
+            out(&format!(
+                "External ~/{rel}: {what}{}",
+                c("2", "   → kit sync")
+            ));
         }
     }
     let pending: Vec<String> = script_status()
@@ -416,12 +748,19 @@ pub fn cmd_status(a: &Args) {
         .collect();
     if !pending.is_empty() {
         problems = true;
-        out(&format!("Scripts waiting to run: {}{}", pending.join(", "), c("2", "   → kit sync")));
+        out(&format!(
+            "Scripts waiting to run: {}{}",
+            pending.join(", "),
+            c("2", "   → kit sync")
+        ));
     }
     for (f, meta, _) in script_status() {
         for e in &meta.errors {
             problems = true;
-            out(&c("33", &format!("scripts/{}: {e}", f.file_name().unwrap().to_string_lossy())));
+            out(&c(
+                "33",
+                &format!("scripts/{}: {e}", f.file_name().unwrap().to_string_lossy()),
+            ));
         }
     }
     if cx.source.join(".git").exists() {
@@ -429,41 +768,52 @@ pub fn cmd_status(a: &Args) {
             problems = true;
             out(&c("31", &format!("Repo: in the middle of a git {busy} (finish or abort it in ~/.local/share/kit)")));
         }
-        let dirty = git(&["status", "--porcelain"]).stdout.lines().count();
-        if dirty > 0 || !hidden_by_gitignore().is_empty() {
-            problems = true;
-            out(&format!("Saved, not backed up yet: {} change(s){}", dirty.max(1), c("2", "   → kit sync")));
-        }
+        problems |= show_pending_changes(None);
         if remote_url().is_empty() {
             problems = true;
-            out(&format!("No backup repo yet{}", c("2", "   → make an empty private repo, then kit init <url>")));
-        } else if git(&["rev-parse", "--abbrev-ref", "@{u}"]).code == 0 {
-            let ab: Vec<String> = git(&["rev-list", "--left-right", "--count", "HEAD...@{u}"]).stdout.split_whitespace().map(String::from).collect();
-            if ab.len() == 2 && (ab[0] != "0" || ab[1] != "0") {
-                problems = true;
-                out(&format!("Repo: {} commit(s) to send, {} to get{}", ab[0], ab[1], c("2", "   → kit sync")));
-            }
+            out(&format!(
+                "No backup repo yet{}",
+                c("2", "   → make an empty private repo, then kit init <url>")
+            ));
         }
     }
     if a.flag("verbose") {
         crate::pkg::print_tools();
     }
     if !problems {
-        say(if managed(None).is_empty() { "nothing tracked yet — kit add <file, folder or tool>" } else { "everything in sync" });
+        say(if managed(None).is_empty() {
+            "nothing tracked yet — kit add <file, folder or tool>"
+        } else {
+            "everything in sync"
+        });
     }
 }
 
 // --------------------------------------------------------------------------- save
-/// Copy this machine's changes (changed, new and deleted files) into the repo. Returns how many.
+/// Copy this machine's changes to tracked files into the repo. Returns how many.
 pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
     let cx = ctx();
     let mut synced = load_synced();
     let mut n = 0;
     for (code, rel) in file_changes(prefixes, &synced.clone()) {
         match code {
-            "missing" | "unreadable" | "repo" => continue, // nothing new here; the repo's version comes with kit sync
+            "unreadable" => {
+                fail(&format!("cannot read ~/{rel}"));
+                continue;
+            }
+            "missing" | "repo" => continue, // nothing new here; the repo's version comes with kit sync
             "type" => {
                 warn(&format!("not saved ~/{rel}: a folder here, a file in the repo (kit rm ~/{rel}, then kit add ~/{rel})"));
+                continue;
+            }
+            "delete-conflict" if !force => {
+                fail(&format!("not saved ~/{rel}: deleted here but changed in repo; kit undo takes the repo's or kit save --force keeps the deletion"));
+                continue;
+            }
+            "delete-conflict" => {
+                remove_tree(&rel).unwrap_or_else(|e| die(&e));
+                unmark_synced(&mut synced, &rel);
+                n += 1;
                 continue;
             }
             "both" if !force => {
@@ -490,17 +840,12 @@ pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
             n += 1;
             continue;
         }
-        if code == "new" {
-            if add_one(&rel, force, &mut synced, true) > 0 {
-                out(&format!("  added   {rel}"));
-                n += 1;
-            }
-            continue;
-        }
-        let e = read_entry(&cx.home.join(&rel));
+        let e = read_home_entry(&rel);
         if let Some(problem) = secret_problem(&rel, e.as_ref()) {
             if !force {
-                fail(&format!("~/{rel} not saved: {problem} (kit save --force to store it anyway)"));
+                fail(&format!(
+                    "~/{rel} not saved: {problem} (kit save --force to store it anyway)"
+                ));
                 continue;
             }
         }
@@ -508,6 +853,9 @@ pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
         if let Err(err) = write_tree(&rel, &e) {
             fail(&format!("could not store ~/{rel}: {err}"));
             continue;
+        }
+        if force {
+            allow_secret(&rel, &e);
         }
         mark_synced(&mut synced, &rel, &e);
         out(&format!("  saved   {rel}"));
@@ -520,6 +868,9 @@ pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
 pub fn cmd_save(a: &Args) {
     guard_repo();
     let prefixes = scope(&a.many("paths"));
+    if exit_code() != 0 {
+        return;
+    }
     let n = re_add(prefixes.as_deref(), a.flag("force"));
     if n > 0 {
         say(&format!("{n} change(s) saved — kit sync to back them up"));
@@ -538,7 +889,16 @@ fn merge3(here: &[u8], base: &[u8], repo: &[u8]) -> Option<(Vec<u8>, i32)> {
     fs::write(&b, base).ok()?;
     fs::write(&r, repo).ok()?;
     let out = std::process::Command::new("git")
-        .args(["merge-file", "-p", "-L", "this machine", "-L", "last sync", "-L", "repo"])
+        .args([
+            "merge-file",
+            "-p",
+            "-L",
+            "this machine",
+            "-L",
+            "last sync",
+            "-L",
+            "repo",
+        ])
         .args([&h, &b, &r])
         .output()
         .ok()?;
@@ -557,7 +917,6 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
     let (mut local, mut merged, mut conflicts, mut stuck) = (0, Vec::new(), Vec::new(), Vec::new());
     for (code, rel) in file_changes(prefixes, &synced.clone()) {
         match code {
-            "new" => continue,
             "unreadable" => {
                 fail(&format!("can't read ~/{rel} (permission denied)"));
                 continue;
@@ -566,7 +925,7 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
                 local += 1;
                 continue;
             }
-            "conflict" | "type" if !force => {
+            "conflict" | "type" | "delete-conflict" if !force => {
                 stuck.push((code, rel));
                 continue;
             }
@@ -591,7 +950,9 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         let mut had_conflicts = false;
         if code == "both" && !force {
             let here = read_entry(&tgt);
-            let (Some(Entry::File(hb, _)), Entry::File(rb, rmode), Some(base)) = (&here, &src, get_base(&rel)) else {
+            let (Some(Entry::File(hb, _)), Entry::File(rb, rmode), Some(base)) =
+                (&here, &src, get_base(&rel))
+            else {
                 stuck.push((code, rel));
                 continue;
             };
@@ -612,7 +973,7 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         }
         let result: KResult<()> = (|| {
             if exists_or_link(&tgt) {
-                backup(&stamp, &rel);
+                backup(&stamp, &rel)?;
             }
             if code == "type" {
                 // only with force (kit undo <file>), and backed up just above
@@ -633,7 +994,9 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
             if had_conflicts {
                 conflicts.push(rel);
             } else {
-                out(&format!("  merged ~/{rel} (both machines' changes; yours aren't saved yet)"));
+                out(&format!(
+                    "  merged ~/{rel} (both machines' changes; yours aren't saved yet)"
+                ));
                 merged.push(rel);
             }
         } else {
@@ -647,13 +1010,21 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         note("what was replaced is kept: kit undo puts it back");
     }
     if local > 0 && prefixes.is_none() {
-        note(&format!("{local} file(s) changed here aren't saved yet (kit save, or kit status to see them)"));
+        note(&format!(
+            "{local} file(s) changed here aren't saved yet (kit save, or kit status to see them)"
+        ));
     }
     for (code, rel) in &stuck {
         let why = match *code {
-            "conflict" => "still has conflict markers from an earlier merge; fix them, then kit save",
-            "type" => "is a folder on one side and a file on the other; kit rm it, then kit add it again",
-            _ if get_base(rel).is_none() => "already exists here and differs from the repo, so kit left it alone",
+            "conflict" => {
+                "still has conflict markers from an earlier merge; fix them, then kit save"
+            }
+            "type" => {
+                "is a folder on one side and a file on the other; kit rm it, then kit add it again"
+            }
+            _ if get_base(rel).is_none() => {
+                "already exists here and differs from the repo, so kit left it alone"
+            }
             _ => "changed on both, and kit can't merge it (not a text file)",
         };
         warn(&format!("~/{rel} {why} — kit status ~/{rel} compares them, kit undo ~/{rel} takes the repo's, kit save --force ~/{rel} keeps this one"));
@@ -663,8 +1034,14 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         for rel in &conflicts {
             err_line(&format!("    ~/{rel}"));
         }
-        err_line(&c("2", "    keep what you want between <<<<<<< and >>>>>>>, then kit save"));
-        err_line(&c("2", "    or: kit undo <file> takes the repo's · kit undo goes back to yours"));
+        err_line(&c(
+            "2",
+            "    keep what you want between <<<<<<< and >>>>>>>, then kit save",
+        ));
+        err_line(&c(
+            "2",
+            "    or: kit undo <file> takes the repo's · kit undo goes back to yours",
+        ));
         set_exit(1);
     }
     written
@@ -673,6 +1050,10 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
 /// Write the repo's version here: files, then externals, packages and scripts.
 fn apply_all(run_new_scripts: bool) {
     let written = apply_files(None, false);
+    if !run_new_scripts {
+        fail("setup is incomplete: repository code needs approval (kit sync --trust, or review in a terminal)");
+        return;
+    }
     apply_externals();
     if ctx().is_mac {
         crate::pkg::install_packages();
@@ -707,7 +1088,19 @@ fn warn_if_public(url: &str) {
         return;
     }
     let repo = m[1].to_string();
-    let r = run(&["gh", "repo", "view", &repo, "--json", "visibility", "--jq", ".visibility"], true);
+    let r = run(
+        &[
+            "gh",
+            "repo",
+            "view",
+            &repo,
+            "--json",
+            "visibility",
+            "--jq",
+            ".visibility",
+        ],
+        true,
+    );
     if r.code == 0 && r.stdout.trim().eq_ignore_ascii_case("public") {
         warn(&format!("your backup repo {repo} is PUBLIC: anyone can read your configs. Make it private: gh repo edit {repo} --visibility private"));
     } else if r.code == 0 {
@@ -723,7 +1116,12 @@ fn commit_saved() {
     if is_real_dir(&cx.tree) {
         git_check(&["add", "-f", "-A", "--", "home"]); // tracked files hidden by a .gitignore inside home/
     }
-    let staged: Vec<String> = git(&["diff", "--cached", "--name-only", "-z"]).stdout.split('\0').filter(|s| !s.is_empty()).map(String::from).collect();
+    let staged: Vec<String> = git(&["diff", "--cached", "--name-only", "-z"])
+        .stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
     if staged.is_empty() {
         return;
     }
@@ -733,7 +1131,12 @@ fn commit_saved() {
         if let Some(rest) = f.strip_prefix("home/") {
             if !is_link(&p) {
                 if let Ok(b) = fs::read(&p) {
-                    if let Some(hit) = secret_hit(&b) {
+                    if let Some(hit) = secret_hit(&b).filter(|_| {
+                        load_obj(&cx.state.join("secret-overrides.json"))
+                            .get(rest)
+                            .and_then(Value::as_str)
+                            != Some(content_hash(&b).as_str())
+                    }) {
                         leaks.push(format!("~/{rest} ({hit})"));
                     }
                 }
@@ -747,28 +1150,150 @@ fn commit_saved() {
             leaks.join("\n    ")
         ));
     }
-    let msg = format!("kit sync {} on {}", chrono::Local::now().format("%Y-%m-%d %H:%M"), hostname());
+    let msg = format!(
+        "kit sync {} on {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+        hostname()
+    );
     git_check(&["commit", "-q", "-m", &msg]);
+}
+
+/// Read git blobs without converting binary data or losing executable/symlink modes.
+fn git_entry(rev: &str, file: &str) -> Option<Entry> {
+    let mode = git(&["ls-tree", rev, "--", file])
+        .stdout
+        .split_whitespace()
+        .next()?
+        .to_string();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ctx().source)
+        .args(["show", &format!("{rev}:{file}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    if mode == "120000" {
+        Some(Entry::Link(String::from_utf8(output.stdout).ok()?))
+    } else {
+        Some(Entry::File(
+            output.stdout,
+            if mode == "100755" { 0o755 } else { 0o644 },
+        ))
+    }
+}
+
+/// JSON metadata merges by keys, so two machines adding different tools do not conflict.
+fn merge_metadata(file: &str, ours: &[u8], base: &[u8], theirs: &[u8]) -> Option<(Vec<u8>, i32)> {
+    if file.ends_with(".json") {
+        if let (Ok(o), Ok(b), Ok(t)) = (
+            serde_json::from_slice::<Value>(ours),
+            serde_json::from_slice::<Value>(base),
+            serde_json::from_slice::<Value>(theirs),
+        ) {
+            if file == "dirs.json" {
+                if let (Some(o), Some(b), Some(t)) = (o.as_array(), b.as_array(), t.as_array()) {
+                    let mut out = Vec::new();
+                    for v in o.iter().chain(t.iter()) {
+                        if !out.contains(v) && (!b.contains(v) || (o.contains(v) && t.contains(v)))
+                        {
+                            out.push(v.clone());
+                        }
+                    }
+                    return Some((serde_json::to_vec_pretty(&out).ok()?, 0));
+                }
+            }
+            if let Ok(Some(v)) = merge_json(Some(&b), Some(&o), Some(&t)) {
+                return Some((serde_json::to_vec_pretty(&v).ok()?, 0));
+            }
+            return None;
+        }
+    }
+    merge3(ours, base, theirs)
+}
+
+fn merge_json(
+    base: Option<&Value>,
+    ours: Option<&Value>,
+    theirs: Option<&Value>,
+) -> Result<Option<Value>, ()> {
+    if ours == theirs {
+        return Ok(ours.cloned());
+    }
+    if ours == base {
+        return Ok(theirs.cloned());
+    }
+    if theirs == base {
+        return Ok(ours.cloned());
+    }
+    if let (Some(Value::Object(o)), Some(Value::Object(t))) = (ours, theirs) {
+        let b = base.and_then(Value::as_object);
+        let keys: std::collections::BTreeSet<_> = o
+            .keys()
+            .chain(t.keys())
+            .chain(b.into_iter().flat_map(|b| b.keys()))
+            .collect();
+        let mut out = serde_json::Map::new();
+        for k in keys {
+            if let Some(v) = merge_json(b.and_then(|b| b.get(k)), o.get(k), t.get(k))? {
+                out.insert(k.clone(), v);
+            }
+        }
+        return Ok(Some(Value::Object(out)));
+    }
+    Err(())
 }
 
 /// After both machines saved the same files: drop this machine's unpushed commits (their changes
 /// are still in $HOME) and let the home-level merge combine them with the other machine's.
 fn reconcile_with_remote() {
     let cx = ctx();
-    let mb = git(&["merge-base", "HEAD", "@{u}"]).stdout.trim().to_string();
+    let mb = git(&["merge-base", "HEAD", "@{u}"])
+        .stdout
+        .trim()
+        .to_string();
     if mb.is_empty() {
         die("this machine's repo and the backup repo have no history in common; fix it by hand in ~/.local/share/kit");
     }
-    let changed: Vec<String> = git(&["diff", "--name-only", &mb, "HEAD"]).stdout.lines().map(String::from).collect();
+    let changed: Vec<String> = git(&["diff", "--name-only", "-z", &mb, "HEAD"])
+        .stdout
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
     let mut synced = load_synced();
+    let stamp = now_stamp();
+    release_stamp(&stamp);
+    let recovery = format!("refs/kit/recovery/{stamp}");
+    git_check(&["update-ref", &recovery, "HEAD"]);
+    let mut additions = Vec::new();
+    let mut deletions = Vec::new();
     let mut lost = Vec::new();
     for f in &changed {
         if let Some(rel) = f.strip_prefix("home/") {
             // the last version both machines had is the merge base
-            let base = git(&["show", &format!("{mb}:{f}")]);
-            if base.code == 0 {
-                let data = render(rel, base.stdout.as_bytes(), &local_contexts());
-                mark_synced(&mut synced, rel, &Entry::File(data, 0o644));
+            let base = git_entry(&mb, f);
+            let ours = git_entry("HEAD", f);
+            let theirs = git_entry("@{u}", f);
+            if ours.is_none() && !same(base.as_ref(), theirs.as_ref()) {
+                die(&format!("~/{rel}: deleted here but changed remotely; repo kept intact, recovery: {recovery}"));
+            }
+            if theirs.is_none() && base.is_some() && !same(ours.as_ref(), base.as_ref()) {
+                die(&format!("~/{rel}: changed here but deleted remotely; repo kept intact, recovery: {recovery}"));
+            }
+            if same(base.as_ref(), theirs.as_ref()) {
+                if let Some(e) = ours {
+                    additions.push((rel.to_string(), e));
+                } else {
+                    deletions.push(rel.to_string());
+                }
+            }
+            if let Some(mut e) = base {
+                if let Entry::File(b, _) = &mut e {
+                    *b = render(rel, b, &local_contexts());
+                }
+                mark_synced(&mut synced, rel, &e);
             } else {
                 unmark_synced(&mut synced, rel);
             }
@@ -779,17 +1304,28 @@ fn reconcile_with_remote() {
                 (r.code == 0).then_some(r.stdout.into_bytes())
             };
             match (get("HEAD"), get(&mb), get("@{u}")) {
-                (Some(ours), Some(base), Some(theirs)) => match merge3(&ours, &base, &theirs) {
+                (Some(ours), Some(base), Some(theirs)) => match merge_metadata(f, &ours, &base, &theirs) {
                     Some((text, 0)) => lost.push((f.clone(), Some(text))),
-                    _ => lost.push((f.clone(), None)),
+                    _ => die(&format!("{f}: conflicting repository changes; repo kept intact, recovery: {recovery}")),
                 },
                 (Some(ours), None, None) => lost.push((f.clone(), Some(ours))), // new here only
-                _ => lost.push((f.clone(), None)),
+                (None, Some(base), Some(theirs)) if base == theirs => lost.push((f.clone(), None)),
+                (Some(ours), Some(base), None) if ours == base => {},
+                _ => die(&format!("{f}: conflicting repository changes; repo kept intact, recovery: {recovery}")),
             }
         }
     }
     save_synced(&synced);
     git_check(&["reset", "-q", "--hard", "@{u}"]);
+    for (rel, e) in additions {
+        write_tree(&rel, &e).unwrap_or_else(|e| die(&e));
+        mark_synced(&mut synced, &rel, &e);
+    }
+    for rel in deletions {
+        remove_tree(&rel).unwrap_or_else(|e| die(&e));
+        unmark_synced(&mut synced, &rel);
+    }
+    save_synced(&synced);
     for (f, text) in lost {
         match text {
             Some(t) => {
@@ -797,12 +1333,109 @@ fn reconcile_with_remote() {
                 if let Some(parent) = p.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
-                let _ = fs::write(p, t);
+                write_atomic(&p, &t, 0o644).unwrap_or_else(|e| {
+                    die(&format!("cannot restore {f}: {e}; recovery: {recovery}"))
+                });
             }
-            None => warn(&format!("{f}: both machines changed it in the same place; kept the other machine's version (redo your change)")),
+            None => {
+                let p = cx.source.join(&f);
+                if p.is_file() {
+                    fs::remove_file(p).unwrap_or_else(|e| die(&e.to_string()));
+                }
+            }
         }
     }
     warn("this machine and another one saved changes to the same files; combining them here (check them, then kit save and kit sync)");
+}
+
+fn allow_secret(rel: &str, e: &Entry) {
+    if let Entry::File(b, _) = e {
+        let path = ctx().state.join("secret-overrides.json");
+        let mut allowed = load_obj(&path);
+        allowed.insert(rel.into(), Value::from(content_hash(b)));
+        save_json(&path, &Value::Object(allowed));
+    }
+}
+
+fn content_hash(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+fn queue_cloned_code() {
+    let cx = ctx();
+    let mut pending = serde_json::Map::new();
+    for (f, _, _) in script_status() {
+        let name = format!("scripts/{}", f.file_name().unwrap().to_string_lossy());
+        pending.insert(
+            name,
+            Value::from(content_hash(&fs::read(f).unwrap_or_default())),
+        );
+    }
+    if !load_obj(&cx.externals).is_empty() {
+        pending.insert(
+            "externals.json".into(),
+            Value::from(content_hash(&fs::read(&cx.externals).unwrap_or_default())),
+        );
+    }
+    for (n, p) in load_obj(&cx.pkgs) {
+        for platform in ["mac", "linux"] {
+            if let Some(spec) = p
+                .get(platform)
+                .and_then(Value::as_str)
+                .filter(|s| s.starts_with("cmd:"))
+            {
+                pending.insert(
+                    format!("tool:{n}:{platform}"),
+                    Value::from(content_hash(spec.as_bytes())),
+                );
+            }
+        }
+    }
+    save_json(&cx.state.join("pending-code.json"), &Value::Object(pending));
+}
+
+fn review_pending_code(trust: bool) -> bool {
+    let cx = ctx();
+    let path = cx.state.join("pending-code.json");
+    let mut pending = load_obj(&path);
+    pending.retain(|name, hash| {
+        let current = if let Some(tool) = name.strip_prefix("tool:") {
+            tool.rsplit_once(':').and_then(|(n, platform)| {
+                load_obj(&cx.pkgs)
+                    .get(n)
+                    .and_then(|p| p.get(platform))
+                    .and_then(Value::as_str)
+                    .map(|s| content_hash(s.as_bytes()))
+            })
+        } else {
+            fs::read(cx.source.join(name))
+                .ok()
+                .map(|b| content_hash(&b))
+        };
+        if let Some(current) = current {
+            *hash = Value::from(current);
+            true
+        } else {
+            false
+        }
+    });
+    if pending.is_empty() {
+        save_json(&path, &Value::Object(pending));
+        return true;
+    }
+    out("Repository code waiting for review:");
+    for name in pending.keys() {
+        out(&format!("  {name}"));
+    }
+    if trust || (cx.interactive && ask("Run this repository code? [y/N]") == "y") {
+        save_json(&path, &serde_json::json!({}));
+        true
+    } else {
+        save_json(&path, &Value::Object(pending));
+        warn("not running repository code without approval; inspect it, then kit sync --trust");
+        false
+    }
 }
 
 /// Get what other machines saved. Returns false when new commits change scripts or `cmd:` tools
@@ -812,14 +1445,25 @@ fn pull() -> bool {
     let old = git(&["rev-parse", "HEAD"]).stdout.trim().to_string();
     let fetch = git(&["fetch", "-q", "origin"]);
     if fetch.code != 0 {
-        die(&format!("couldn't reach the backup repo:\n{}", fetch.stderr.trim()));
+        die(&format!(
+            "couldn't reach the backup repo:\n{}",
+            fetch.stderr.trim()
+        ));
     }
     if git(&["rev-parse", "--abbrev-ref", "@{u}"]).code != 0 {
-        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim().to_string();
+        let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .stdout
+            .trim()
+            .to_string();
         if git(&["rev-parse", "--verify", "-q", &format!("origin/{branch}")]).code != 0 {
             return true; // empty backup repo: nothing to get yet
         }
-        git(&["branch", "-q", "--set-upstream-to", &format!("origin/{branch}")]);
+        git(&[
+            "branch",
+            "-q",
+            "--set-upstream-to",
+            &format!("origin/{branch}"),
+        ]);
     }
     let r = git(&["rebase", "-q", "@{u}"]);
     if r.code != 0 {
@@ -829,51 +1473,67 @@ fn pull() -> bool {
         reconcile_with_remote();
     }
     let new = git(&["rev-parse", "HEAD"]).stdout.trim().to_string();
-    if new == old || old.is_empty() {
-        return true;
+    if new != old && !old.is_empty() {
+        let base = git(&["merge-base", &old, &new]).stdout.trim().to_string();
+        let mut pending = load_obj(&cx.state.join("pending-code.json"));
+        for f in git(&[
+            "diff",
+            "--name-only",
+            "-z",
+            &format!("{base}..{new}"),
+            "--",
+            "scripts",
+            "externals.json",
+        ])
+        .stdout
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        {
+            if let Ok(data) = fs::read(cx.source.join(f)) {
+                pending.insert(f.into(), Value::from(content_hash(&data)));
+            }
+        }
+        let before: serde_json::Map<String, Value> =
+            serde_json::from_str(&git(&["show", &format!("{base}:packages.json")]).stdout)
+                .unwrap_or_default();
+        for (n, p) in load_obj(&cx.pkgs) {
+            for platform in ["mac", "linux"] {
+                if let Some(spec) = p.get(platform).and_then(Value::as_str) {
+                    if spec.starts_with("cmd:")
+                        && before
+                            .get(&n)
+                            .and_then(|p| p.get(platform))
+                            .and_then(Value::as_str)
+                            != Some(spec)
+                    {
+                        pending.insert(
+                            format!("tool:{n}:{platform}"),
+                            Value::from(content_hash(spec.as_bytes())),
+                        );
+                    }
+                }
+            }
+        }
+        save_json(&cx.state.join("pending-code.json"), &Value::Object(pending));
     }
-    let base = git(&["merge-base", &old, &new]).stdout.trim().to_string();
-    let got = git(&["rev-list", "--count", &format!("{base}..{new}")]).stdout.trim().to_string();
-    if got != "0" {
-        say(&format!("got {got} change set(s) from other machines"));
-    }
-    let risky: Vec<String> = git(&["diff", "--name-only", &format!("{base}..{new}"), "--", "scripts", "externals.json"]).stdout.split_whitespace().map(String::from).collect();
-    let pk_old: serde_json::Map<String, Value> = serde_json::from_str(&git(&["show", &format!("{base}:packages.json")]).stdout).unwrap_or_default();
-    let cmds: Vec<(String, String)> = load_obj(&cx.pkgs)
-        .iter()
-        .filter_map(|(n, p)| {
-            let spec = p.get(cx.platform)?.as_str()?;
-            let before = pk_old.get(n).and_then(|o| o.get(cx.platform)).and_then(Value::as_str);
-            (spec.starts_with("cmd:") && before != Some(spec)).then(|| (n.clone(), spec.to_string()))
-        })
-        .collect();
-    if risky.is_empty() && cmds.is_empty() {
-        return true;
-    }
-    out("Other machines changed things that run code here:");
-    for f in &risky {
-        out(&format!("  {f}"));
-    }
-    for (n, spec) in &cmds {
-        out(&format!("  tool {n}: {spec}"));
-    }
-    if cx.interactive {
-        ask("Run them? [y/N]") == "y"
-    } else {
-        warn("not running them without a terminal; run kit sync in a terminal to review and allow them");
-        false
-    }
+    true
 }
 
-pub fn cmd_sync(_a: &Args) {
+pub fn cmd_sync(a: &Args) {
     let cx = ctx();
     if !cx.source.join(".git").exists() {
         die("no kit repo yet (kit init)");
     }
     guard_repo();
+    crate::remote::ensure_mise();
     commit_saved();
     let url = remote_url();
-    let allowed = if url.is_empty() { true } else { pull() };
+    let pulled = if url.is_empty() { true } else { pull() };
+    let allowed = if a.flag("trust") {
+        review_pending_code(true)
+    } else {
+        pulled && review_pending_code(false)
+    };
     apply_all(allowed);
     commit_saved(); // repo files combined during the pull
     if url.is_empty() {
@@ -886,7 +1546,10 @@ pub fn cmd_sync(_a: &Args) {
     }
     let r = git(&["push", "-q", "-u", "origin", "HEAD"]);
     if r.code != 0 {
-        die(&format!("couldn't send your changes to {url}:\n{}", r.stderr.trim()));
+        die(&format!(
+            "couldn't send your changes to {url}:\n{}",
+            r.stderr.trim()
+        ));
     }
     say(&format!("backed up to {url}"));
     warn_if_public(&url);
@@ -900,7 +1563,13 @@ fn files_under(base: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn backup_sets() -> Vec<String> {
-    let mut sets: Vec<String> = fs::read_dir(&ctx().backups).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    let mut sets: Vec<String> = fs::read_dir(&ctx().backups)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     sets.sort();
     sets
 }
@@ -910,6 +1579,7 @@ fn restore(stamp: &str) {
     let cx = ctx();
     let base = cx.backups.join(stamp);
     let now = now_stamp();
+    let mut failed = false;
     for p in files_under(&base) {
         let rel = rel_to(&p, &base).unwrap_or_default();
         let result: KResult<()> = (|| {
@@ -919,22 +1589,41 @@ fn restore(stamp: &str) {
                 // a symlink/file now sits where the backup had a folder
                 parent = parent.join(part);
                 if is_link(&parent) || parent.is_file() {
-                    backup(&now, &rel_to(&parent, &cx.home).unwrap_or_default());
+                    backup(&now, &rel_to(&parent, &cx.home).unwrap_or_default())?;
                     fs::remove_file(&parent).map_err(|e| e.to_string())?;
                 }
             }
-            backup(&now, &rel);
+            backup(&now, &rel)?;
             let e = read_entry(&p).ok_or("backup file vanished")?;
+            if is_real_dir(&cx.home.join(&rel)) {
+                fs::remove_dir_all(cx.home.join(&rel)).map_err(|e| e.to_string())?;
+            }
             write_home(&rel, &e)
         })();
         match result {
             Ok(()) => out(&format!("  put back ~/{rel}")),
-            Err(e) => fail(&format!("could not put back ~/{rel}: {e}")),
+            Err(e) => {
+                failed = true;
+                fail(&format!("could not put back ~/{rel}: {e}"));
+            }
         }
     }
-    let _ = fs::remove_dir_all(&base); // used up; what it replaced is now the newest backup
+    if !failed {
+        let _ = fs::remove_dir_all(&base);
+    }
     release_stamp(&now);
-    say(&format!("done{}", if cx.backups.join(&now).exists() { " (kit undo again to reverse this)" } else { "" }));
+    if failed {
+        warn(&format!("backup {stamp} kept; retry with kit undo {stamp}"));
+    } else {
+        say(&format!(
+            "done{}",
+            if cx.backups.join(&now).exists() {
+                " (kit undo again to reverse this)"
+            } else {
+                ""
+            }
+        ));
+    }
 }
 
 pub fn cmd_undo(a: &Args) {
@@ -947,7 +1636,8 @@ pub fn cmd_undo(a: &Args) {
         }
         return;
     }
-    let (stamps, files): (Vec<String>, Vec<String>) = args.into_iter().partition(|s| sets.contains(s));
+    let (stamps, files): (Vec<String>, Vec<String>) =
+        args.into_iter().partition(|s| sets.contains(s));
     for s in &stamps {
         restore(s);
     }
@@ -973,11 +1663,23 @@ pub fn apply_externals() {
         let dest = path_str(&home.join(&rel));
         let ok = if st == "missing" {
             say(&format!("cloning {url} into ~/{rel}"));
-            let mut args: Vec<String> = ["git", "-c", "advice.detachedHead=false", "clone", "-q", "--depth", "1"].iter().map(|s| s.to_string()).collect();
+            let mut args: Vec<String> = [
+                "git",
+                "-c",
+                "advice.detachedHead=false",
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             if let Some(r) = &r#ref {
                 args.push("--branch".into());
                 args.push(r.clone());
             }
+            args.push("--".into());
             args.push(url.clone());
             args.push(dest);
             run(&args, false).code == 0
@@ -993,7 +1695,8 @@ pub fn apply_externals() {
             if g(&["fetch", "-q", "--depth", "1", "origin", &tagref], true) {
                 g(&["checkout", "-q", &r], false)
             } else {
-                g(&["fetch", "-q", "--depth", "1", "origin", &r], true) && g(&["checkout", "-q", "FETCH_HEAD"], false)
+                g(&["fetch", "-q", "--depth", "1", "origin", &r], true)
+                    && g(&["checkout", "-q", "FETCH_HEAD"], false)
             }
         };
         if !ok {
@@ -1011,14 +1714,19 @@ pub fn migrate_state() {
     }
     let _ = fs::create_dir_all(&cx.state);
     if old.join("scripts.json").exists() && !cx.script_state.exists() {
-        let _ = fs::rename(old.join("scripts.json"), &cx.script_state);
+        fs::rename(old.join("scripts.json"), &cx.script_state)
+            .unwrap_or_else(|e| die(&format!("state migration failed; old state kept: {e}")));
     }
     if let Ok(rd) = fs::read_dir(old.join("backups")) {
         let _ = fs::create_dir_all(&cx.backups);
         for s in rd.flatten() {
             let dest = cx.backups.join(s.file_name());
             if !dest.exists() {
-                let _ = fs::rename(s.path(), dest);
+                fs::rename(s.path(), dest).unwrap_or_else(|e| {
+                    die(&format!("backup migration failed; old state kept: {e}"))
+                });
+            } else {
+                die("backup migration collision; old state kept for recovery");
             }
         }
     }

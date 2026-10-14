@@ -84,7 +84,11 @@ fn ssh_hosts() -> Vec<String> {
         let re = regex::Regex::new(r"(?i)^\s*Host\s+(.+)").unwrap();
         for line in text.lines() {
             if let Some(m) = re.captures(line) {
-                hosts.extend(m[1].split_whitespace().filter(|h| !h.contains(['*', '?', '!'])).map(String::from));
+                hosts.extend(
+                    m[1].split_whitespace()
+                        .filter(|h| !h.contains(['*', '?', '!']))
+                        .map(String::from),
+                );
             }
         }
     }
@@ -100,7 +104,10 @@ fn tracked_paths(cur: &str) -> Vec<String> {
         ("~/".to_string(), cur.get(2..).unwrap_or("").to_string())
     } else if let Some(rest) = cur.strip_prefix(&format!("{home}/")) {
         (format!("{home}/"), rest.to_string())
-    } else if std::env::current_dir().map(|d| path_str(&d) == home).unwrap_or(false) {
+    } else if std::env::current_dir()
+        .map(|d| path_str(&d) == home)
+        .unwrap_or(false)
+    {
         (String::new(), cur.to_string())
     } else {
         return vec!["__files__".into()];
@@ -122,10 +129,15 @@ fn tracked_paths(cur: &str) -> Vec<String> {
             None => (rest, false),
         };
         if !seg.is_empty() {
-            seen.insert(format!("{base}{head}{seg}{}", if more { "/" } else { "" }), if more { "" } else { "tracked" });
+            seen.insert(
+                format!("{base}{head}{seg}{}", if more { "/" } else { "" }),
+                if more { "" } else { "tracked" },
+            );
         }
     }
-    seen.into_iter().map(|(k, v)| if v.is_empty() { k } else { format!("{k}\t{v}") }).collect()
+    seen.into_iter()
+        .map(|(k, v)| if v.is_empty() { k } else { format!("{k}\t{v}") })
+        .collect()
 }
 
 fn about(c: &Command) -> String {
@@ -144,7 +156,10 @@ pub fn complete(words: &[String]) -> Vec<String> {
         prev.splice(0..2, ["pkg".to_string(), "add".to_string()]);
     }
     if prev.first().map(String::as_str) == Some("help") && prev.len() == 1 {
-        return complete(&[String::new()]).into_iter().filter(|l| !l.starts_with("help\t")).collect();
+        return complete(&[String::new()])
+            .into_iter()
+            .filter(|l| !l.starts_with("help\t"))
+            .collect();
     }
     let root = build_cli();
     let mut cmd = &root;
@@ -158,7 +173,8 @@ pub fn complete(words: &[String]) -> Vec<String> {
         if w.starts_with('-') {
             let key = w.split('=').next().unwrap_or("");
             let arg = cmd.get_arguments().find(|a| {
-                a.get_long().is_some_and(|l| key == format!("--{l}")) || a.get_short().is_some_and(|s| key == format!("-{s}"))
+                a.get_long().is_some_and(|l| key == format!("--{l}"))
+                    || a.get_short().is_some_and(|s| key == format!("-{s}"))
             });
             if let Some(a) = arg {
                 if a.get_action().takes_values() && !w.contains('=') {
@@ -177,7 +193,11 @@ pub fn complete(words: &[String]) -> Vec<String> {
         pos += 1;
     }
     if let Some(a) = expect {
-        return a.get_possible_values().iter().map(|v| v.get_name().to_string()).collect();
+        return a
+            .get_possible_values()
+            .iter()
+            .map(|v| v.get_name().to_string())
+            .collect();
     }
     if cur.starts_with('-') {
         let mut out = Vec::new();
@@ -192,13 +212,19 @@ pub fn complete(words: &[String]) -> Vec<String> {
                 out.push(format!("-{s}\t{help}"));
             }
         }
-        if cmd.get_arguments().all(|a| a.get_long() != Some("help")) && !cmd.is_disable_help_flag_set() {
+        if cmd.get_arguments().all(|a| a.get_long() != Some("help"))
+            && !cmd.is_disable_help_flag_set()
+        {
             out.push("--help\tshow this help".into());
         }
         return out;
     }
     if cmd.has_subcommands() && pos == 0 {
-        let mut out: Vec<String> = cmd.get_subcommands().filter(|s| !s.is_hide_set()).map(|s| format!("{}\t{}", s.get_name(), about(s))).collect();
+        let mut out: Vec<String> = cmd
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| format!("{}\t{}", s.get_name(), about(s)))
+            .collect();
         if path.is_empty() {
             out.push("help\thelp for a command".into());
         }
@@ -222,15 +248,35 @@ pub fn complete(words: &[String]) -> Vec<String> {
     let cmdpath: Vec<&str> = path.iter().map(String::as_str).collect();
     let cx = ctx();
     match id {
+        "names" if cmdpath.first() == Some(&"packages") => crate::pkg::load_pkgs()
+            .keys()
+            .map(|n| format!("{n}\ttracked package"))
+            .collect(),
         "paths" => {
-            let mut v = if FILE_ARGS.contains(&cmdpath.as_slice()) { vec!["__files__".to_string()] } else { tracked_paths(&cur) };
+            let mut v = if FILE_ARGS.contains(&cmdpath.as_slice()) {
+                vec!["__files__".to_string()]
+            } else {
+                tracked_paths(&cur)
+            };
             if cmdpath == ["rm"] && !cur.contains('/') && !cur.starts_with('~') {
                 v.extend(crate::pkg::load_pkgs().keys().map(|n| format!("{n}\ttool")));
             }
             if cmdpath == ["undo"] && !cur.contains('/') && !cur.starts_with('~') {
-                let mut stamps: Vec<String> = fs::read_dir(&cx.backups).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+                let mut stamps: Vec<String> = fs::read_dir(&cx.backups)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 stamps.sort();
-                v.extend(stamps.into_iter().rev().take(10).map(|s| format!("{s}\tbackup")));
+                v.extend(
+                    stamps
+                        .into_iter()
+                        .rev()
+                        .take(10)
+                        .map(|s| format!("{s}\tbackup")),
+                );
             }
             v
         }
@@ -243,9 +289,16 @@ pub fn complete(words: &[String]) -> Vec<String> {
 fn completion_targets() -> Vec<(&'static str, PathBuf)> {
     let cx = ctx();
     let mut out = Vec::new();
-    let zshes: Vec<PathBuf> = which("zsh").into_iter().chain([cx.home.join(REMOTE_KIT).join("opt/zsh/bin/zsh")]).filter(|z| is_executable(z)).collect();
+    let zshes: Vec<PathBuf> = which("zsh")
+        .into_iter()
+        .chain([cx.home.join(REMOTE_KIT).join("opt/zsh/bin/zsh")])
+        .filter(|z| is_executable(z))
+        .collect();
     for z in zshes {
-        let r = run(&[path_str(&z), "-fc".into(), "print -l $fpath".into()], true);
+        let r = run(
+            &[path_str(&z), "-fc".into(), "print -l $fpath".into()],
+            true,
+        );
         for d in r.stdout.lines() {
             let p = PathBuf::from(d);
             if !d.is_empty() && p.is_dir() && writable(&p) {
@@ -257,10 +310,18 @@ fn completion_targets() -> Vec<(&'static str, PathBuf)> {
             }
         }
     }
-    let data = std::env::var("XDG_DATA_HOME").ok().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| cx.home.join(".local/share"));
+    let data = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cx.home.join(".local/share"));
     out.push(("bash", data.join("bash-completion/completions/kit")));
     if have("fish") || cx.home.join(".config/fish").is_dir() {
-        let cfg = std::env::var("XDG_CONFIG_HOME").ok().filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| cx.home.join(".config"));
+        let cfg = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cx.home.join(".config"));
         out.push(("fish", cfg.join("fish/completions/kit.fish")));
     }
     out
@@ -268,7 +329,9 @@ fn completion_targets() -> Vec<(&'static str, PathBuf)> {
 
 fn writable(p: &std::path::Path) -> bool {
     use std::ffi::CString;
-    let Ok(c) = CString::new(path_str(p)) else { return false };
+    let Ok(c) = CString::new(path_str(p)) else {
+        return false;
+    };
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
@@ -280,7 +343,10 @@ pub fn install_completions(quiet: bool) -> Vec<PathBuf> {
         let result = if current.as_deref() == Some(script) {
             Ok(())
         } else {
-            dest.parent().map(fs::create_dir_all).transpose().and_then(|_| write_atomic(&dest, script.as_bytes(), 0o644))
+            dest.parent()
+                .map(fs::create_dir_all)
+                .transpose()
+                .and_then(|_| write_atomic(&dest, script.as_bytes(), 0o644))
         };
         match result {
             Ok(()) => done.push(dest),
@@ -295,10 +361,16 @@ pub fn install_completions(quiet: bool) -> Vec<PathBuf> {
 pub fn ensure_completions() {
     let cx = ctx();
     let stamp = cx.state.join("completions");
-    let me = hex::encode(Sha1::digest(format!("{VERSION}{ZSH}{BASH}{FISH}").as_bytes()));
+    let me = hex::encode(Sha1::digest(
+        format!("{VERSION}{ZSH}{BASH}{FISH}").as_bytes(),
+    ));
     if let Ok(old) = fs::read_to_string(&stamp) {
         let mut lines = old.lines();
-        if lines.next() == Some(me.as_str()) && lines.filter(|l| !l.is_empty()).all(|p| PathBuf::from(p).is_file()) {
+        if lines.next() == Some(me.as_str())
+            && lines
+                .filter(|l| !l.is_empty())
+                .all(|p| PathBuf::from(p).is_file())
+        {
             return;
         }
     }

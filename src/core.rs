@@ -4,13 +4,26 @@ use regex::bytes::Regex as BRegex;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub type KResult<T> = Result<T, String>;
+
+/// Repository metadata is input too: never allow it to escape a managed root.
+pub fn validate_rel(rel: &str) -> KResult<()> {
+    if rel.is_empty()
+        || rel.chars().any(char::is_control)
+        || Path::new(rel)
+            .components()
+            .any(|p| !matches!(p, std::path::Component::Normal(_)))
+    {
+        return Err(format!("invalid home-relative path: {rel:?}"));
+    }
+    Ok(())
+}
 
 // --------------------------------------------------------------------------- user paths
 /// $HOME-relative path for a user-given path (absolute, ~/..., or relative to cwd or $HOME).
@@ -22,7 +35,11 @@ pub fn rel_of_opt(path: &str, allow_home: bool) -> String {
     let cx = ctx();
     let raw = expanduser(path, &cx.home);
     let cwd = std::env::current_dir().unwrap_or_else(|_| cx.home.clone());
-    let cands: Vec<PathBuf> = if raw.is_absolute() { vec![raw.clone()] } else { vec![cwd.join(&raw), cx.home.join(&raw)] };
+    let cands: Vec<PathBuf> = if raw.is_absolute() {
+        vec![raw.clone()]
+    } else {
+        vec![cwd.join(&raw), cx.home.join(&raw)]
+    };
     let home_real = fs::canonicalize(&cx.home).unwrap_or_else(|_| cx.home.clone());
     let mut rels: Vec<String> = Vec::new();
     for cand in cands {
@@ -85,14 +102,16 @@ pub fn contains_kit(rel: &str) -> bool {
 
 /// Path inside home/ for rel. Refuses to go through a tracked symlink (which would leave the repo).
 pub fn tree_path(rel: &str) -> KResult<PathBuf> {
+    validate_rel(rel)?;
     let tree = &ctx().tree;
     let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
     let mut p = tree.clone();
     for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
         p = p.join(part);
-        if is_link(&p) {
+        if is_link(&p) || p.is_file() {
+            let kind = if is_link(&p) { "symlink" } else { "file" };
             return Err(format!(
-                "~/{rel} is inside the tracked symlink ~/{}; use that path instead",
+                "~/{rel} is inside the tracked {kind} ~/{}; use that path instead (kit rm it before replacing it with a folder)",
                 parts[..=i].join("/")
             ));
         }
@@ -161,16 +180,20 @@ pub fn pattern_match(rel: &str, pattern: &str) -> bool {
 /// The .kitignore line that decides rel (gitignore-style: the last match wins, !pattern un-ignores).
 pub fn ignore_match(rel: &str, contexts: &[&str]) -> Option<(usize, String)> {
     let mut hit = None;
-    for (n, section, pat) in ignore_lines() {
-        if !contexts.contains(&section.as_str()) {
-            continue;
-        }
-        let (neg, p) = match pat.strip_prefix('!') {
-            Some(p) => (true, p),
-            None => (false, pat.as_str()),
-        };
-        if pattern_match(rel, p) {
-            hit = if neg { None } else { Some((n, pat.clone())) };
+    let lines = ignore_lines();
+    // Specific platform/remote sections override global rules, regardless of file order.
+    for context in contexts {
+        for (n, section, pat) in &lines {
+            if section != context {
+                continue;
+            }
+            let (neg, p) = match pat.strip_prefix('!') {
+                Some(p) => (true, p),
+                None => (false, pat.as_str()),
+            };
+            if pattern_match(rel, p) {
+                hit = if neg { None } else { Some((*n, pat.clone())) };
+            }
         }
     }
     hit
@@ -196,10 +219,17 @@ pub fn add_ignore(rels: &[String], section: &str, comment: &str) -> Vec<String> 
     let mut new: Vec<String> = Vec::new();
     for rel in rels {
         if rel.contains('\n') || rel.contains(" #") {
-            fail(&format!("can't ignore ~/{rel:?}: its name has a newline or ' #'; edit .kitignore by hand"));
+            fail(&format!(
+                "can't ignore ~/{rel:?}: its name has a newline or ' #'; edit .kitignore by hand"
+            ));
             continue;
         }
-        let pat = glob_escape(rel) + &if comment.is_empty() { String::new() } else { format!("  # {comment}") };
+        let pat = glob_escape(rel)
+            + &if comment.is_empty() {
+                String::new()
+            } else {
+                format!("  # {comment}")
+            };
         if !lines.contains(&pat) && !new.contains(&pat) {
             new.push(pat);
         }
@@ -208,7 +238,12 @@ pub fn add_ignore(rels: &[String], section: &str, comment: &str) -> Vec<String> 
         return new;
     }
     let header = Regex::new(r"^\[(\w+)\]$").unwrap();
-    let headers: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| header.is_match(l.trim())).map(|(i, _)| i).collect();
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| header.is_match(l.trim()))
+        .map(|(i, _)| i)
+        .collect();
     let at = if section == "all" {
         let mut at = headers.first().copied().unwrap_or(lines.len());
         while at > 0 && lines[at - 1].trim().is_empty() {
@@ -219,7 +254,11 @@ pub fn add_ignore(rels: &[String], section: &str, comment: &str) -> Vec<String> 
         let want = format!("[{section}]");
         match headers.iter().find(|&&i| lines[i].trim() == want) {
             Some(&mine) => {
-                let mut at = headers.iter().find(|&&i| i > mine).copied().unwrap_or(lines.len());
+                let mut at = headers
+                    .iter()
+                    .find(|&&i| i > mine)
+                    .copied()
+                    .unwrap_or(lines.len());
                 while at > mine + 1 && lines[at - 1].trim().is_empty() {
                     at -= 1;
                 }
@@ -243,7 +282,9 @@ pub fn add_ignore(rels: &[String], section: &str, comment: &str) -> Vec<String> 
 /// `kit add` of something forgotten earlier: remove its '# forgotten' line.
 pub fn drop_forgotten(rel: &str) -> bool {
     let path = &ctx().ignore;
-    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
     let pat = glob_escape(rel) + "  # forgotten";
     if !text.lines().any(|l| l == pat) {
         return false;
@@ -254,14 +295,55 @@ pub fn drop_forgotten(rel: &str) -> bool {
     true
 }
 
+/// A forced addition is explicitly usable on other machines, without overriding remote exclusions.
+pub fn unignore_exact(rel: &str) {
+    if ignore_match(rel, &local_contexts()).is_none() {
+        return;
+    }
+    let mut text = fs::read_to_string(&ctx().ignore).unwrap_or_default();
+    let pattern = format!("!/{}", glob_escape(rel));
+    text += &format!("\n[all]\n{pattern}\n[{}]\n{pattern}\n", ctx().platform);
+    write_atomic(&ctx().ignore, text.as_bytes(), 0o644)
+        .unwrap_or_else(|e| die(&format!("cannot update ignore override: {e}")));
+    reset_ignore_cache();
+}
+
 // --------------------------------------------------------------------------- rules (per-platform edits)
+fn check_rule_regex(pattern: &str, path: &str) {
+    Regex::new(pattern)
+        .unwrap_or_else(|e| die(&format!("rules.json: invalid regex for {path}: {e}")));
+}
+
 pub fn load_rules() -> Vec<serde_json::Map<String, Value>> {
-    let bad = || -> ! { die("rules.json must be a list of {\"path\": ..., \"on\": [...], ...} objects (see README)") };
+    let bad = || -> ! {
+        die("rules.json must be a list of {\"path\": ..., \"on\": [...], ...} objects (see README)")
+    };
     match load_json(&ctx().rules, Value::Array(vec![])) {
         Value::Array(items) => items
             .into_iter()
             .map(|r| match r {
-                Value::Object(m) if m.contains_key("path") => m,
+                Value::Object(m)
+                    if m.get("path").and_then(Value::as_str).is_some()
+                        && m.get("on").and_then(Value::as_array).is_some() =>
+                {
+                    let path = m["path"].as_str().unwrap();
+                    validate_rel(path).unwrap_or_else(|e| die(&format!("rules.json: {e}")));
+                    for v in m
+                        .get("delete_lines")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let pat = v.as_str().unwrap_or_else(|| {
+                            die("rules.json: delete_lines must contain strings")
+                        });
+                        check_rule_regex(pat, path);
+                    }
+                    for (pat, _) in pairs(m.get("regex")) {
+                        check_rule_regex(&pat, path);
+                    }
+                    m
+                }
                 _ => bad(),
             })
             .collect(),
@@ -274,7 +356,10 @@ pub fn rules_for(rel: &str, contexts: &[&str]) -> Vec<serde_json::Map<String, Va
         .into_iter()
         .filter(|r| {
             r.get("path").and_then(Value::as_str) == Some(rel)
-                && r.get("on").and_then(Value::as_array).is_some_and(|on| on.iter().any(|o| o.as_str().is_some_and(|o| contexts.contains(&o))))
+                && r.get("on").and_then(Value::as_array).is_some_and(|on| {
+                    on.iter()
+                        .any(|o| o.as_str().is_some_and(|o| contexts.contains(&o)))
+                })
         })
         .collect()
 }
@@ -285,7 +370,10 @@ fn pairs(v: Option<&Value>) -> Vec<(String, String)> {
             a.iter()
                 .filter_map(|p| {
                     let p = p.as_array()?;
-                    Some((p.first()?.as_str()?.to_string(), p.get(1)?.as_str()?.to_string()))
+                    Some((
+                        p.first()?.as_str()?.to_string(),
+                        p.get(1)?.as_str()?.to_string(),
+                    ))
                 })
                 .collect()
         })
@@ -296,7 +384,10 @@ fn pairs(v: Option<&Value>) -> Vec<(String, String)> {
 fn py_repl(repl: &str) -> String {
     let re = Regex::new(r"\\(\d+)|\\g<(\w+)>").unwrap();
     let escaped = repl.replace('$', "$$");
-    re.replace_all(&escaped, |c: &regex::Captures| format!("${{{}}}", c.get(1).or(c.get(2)).unwrap().as_str())).into_owned()
+    re.replace_all(&escaped, |c: &regex::Captures| {
+        format!("${{{}}}", c.get(1).or(c.get(2)).unwrap().as_str())
+    })
+    .into_owned()
 }
 
 pub fn render(rel: &str, data: &[u8], contexts: &[&str]) -> Vec<u8> {
@@ -304,11 +395,22 @@ pub fn render(rel: &str, data: &[u8], contexts: &[&str]) -> Vec<u8> {
     if rules.is_empty() {
         return data.to_vec();
     }
-    let Ok(mut text) = String::from_utf8(data.to_vec()) else { return data.to_vec() };
+    let Ok(mut text) = String::from_utf8(data.to_vec()) else {
+        return data.to_vec();
+    };
     for r in rules {
-        for pat in r.get("delete_lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        for pat in r
+            .get("delete_lines")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
             if let Ok(re) = Regex::new(pat) {
-                text = text.split_inclusive('\n').filter(|l| !re.is_match(l.trim_end_matches('\n'))).collect();
+                text = text
+                    .split_inclusive('\n')
+                    .filter(|l| !re.is_match(l.trim_end_matches('\n')))
+                    .collect();
             }
         }
         for (old, new) in pairs(r.get("replace")) {
@@ -348,7 +450,9 @@ impl Entry {
 pub fn read_entry(path: &Path) -> Option<Entry> {
     let md = match fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Some(Entry::Unreadable),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Some(Entry::Unreadable)
+        }
         Err(_) => return None,
     };
     let ft = md.file_type();
@@ -370,11 +474,41 @@ pub fn read_entry(path: &Path) -> Option<Entry> {
     Some(Entry::Other)
 }
 
+/// Login activation is generated locally and must never be saved into the dotfile repo.
+pub fn read_home_entry(rel: &str) -> Option<Entry> {
+    let mut entry = read_entry(&ctx().home.join(rel));
+    if matches!(
+        rel,
+        ".bashrc"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".profile"
+            | ".zshrc"
+            | ".zprofile"
+            | ".zshenv"
+            | ".fizsh/.zshrc"
+            | ".config/fish/config.fish"
+    ) {
+        if let Some(Entry::File(data, _)) = &mut entry {
+            static HOOK: OnceLock<BRegex> = OnceLock::new();
+            let re = HOOK.get_or_init(|| {
+                BRegex::new(r"(?ms)^# >>> kit: [^\n]*\n.*?^# <<< kit <<<[^\n]*\n?").unwrap()
+            });
+            *data = re.replace_all(data, &b""[..]).into_owned();
+        }
+    }
+    entry
+}
+
 pub fn digest(e: Option<&Entry>) -> Option<String> {
     match e? {
         Entry::File(b, m) => {
             let h = hex::encode(Sha256::digest(b));
-            Some(format!("{}{}", &h[..20], if m & 0o111 != 0 { "x" } else { "" }))
+            Some(format!(
+                "{}{}",
+                &h[..20],
+                if m & 0o111 != 0 { "x" } else { "" }
+            ))
         }
         Entry::Link(t) => Some(format!("link:{t}")),
         _ => None,
@@ -384,22 +518,35 @@ pub fn digest(e: Option<&Entry>) -> Option<String> {
 pub fn same(a: Option<&Entry>, b: Option<&Entry>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(Entry::File(x, mx)), Some(Entry::File(y, my))) => x == y && ((mx & 0o111 != 0) == (my & 0o111 != 0)),
+        (Some(Entry::File(x, mx)), Some(Entry::File(y, my))) => {
+            x == y && ((mx & 0o111 != 0) == (my & 0o111 != 0))
+        }
         (Some(Entry::Link(x)), Some(Entry::Link(y))) => x == y,
         _ => false,
     }
 }
 
 /// Walk like os.walk without following symlinks: symlinked folders count as entries.
-pub fn walk_entries(base: &Path, rel_base: &str, out: &mut Vec<String>, skip_dir: &mut dyn FnMut(&str, &Path) -> bool) {
+pub fn walk_entries(
+    base: &Path,
+    rel_base: &str,
+    out: &mut Vec<String>,
+    skip_dir: &mut dyn FnMut(&str, &Path) -> bool,
+) {
     let Ok(rd) = fs::read_dir(base) else { return };
     let mut items: Vec<_> = rd.flatten().collect();
     items.sort_by_key(|e| e.file_name());
     for ent in items {
         let name = ent.file_name().to_string_lossy().into_owned();
-        let rel = if rel_base.is_empty() { name.clone() } else { format!("{rel_base}/{name}") };
+        let rel = if rel_base.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_base}/{name}")
+        };
         let p = ent.path();
-        let Ok(md) = fs::symlink_metadata(&p) else { continue };
+        let Ok(md) = fs::symlink_metadata(&p) else {
+            continue;
+        };
         if md.is_dir() {
             if !skip_dir(&rel, &p) {
                 walk_entries(&p, &rel, out, skip_dir);
@@ -418,7 +565,10 @@ pub fn managed(prefixes: Option<&[String]>) -> Vec<String> {
     }
     let mut all = Vec::new();
     walk_entries(tree, "", &mut all, &mut |_, _| false);
-    let mut out: Vec<String> = all.into_iter().filter(|r| prefixes.is_none_or(|ps| ps.iter().any(|p| under(r, p)))).collect();
+    let mut out: Vec<String> = all
+        .into_iter()
+        .filter(|r| prefixes.is_none_or(|ps| ps.iter().any(|p| under(r, p))))
+        .collect();
     out.sort();
     out
 }
@@ -437,6 +587,7 @@ pub fn private(rel: &str) -> bool {
 
 /// Write a tracked entry into $HOME. Never deletes a folder.
 pub fn write_home(rel: &str, entry: &Entry) -> KResult<()> {
+    validate_rel(rel)?;
     let home = &ctx().home;
     let parts: Vec<&str> = rel.split('/').collect();
     let mut p = home.clone();
@@ -444,13 +595,27 @@ pub fn write_home(rel: &str, entry: &Entry) -> KResult<()> {
         p = p.join(part);
         match read_entry(&p) {
             None => {
-                fs::create_dir(&p).map_err(|e| format!("could not create ~/{}: {e}", rel_to(&p, home).unwrap_or_default()))?;
-                let mode = if *part == ".ssh" || *part == ".gnupg" { 0o700 } else { 0o755 };
+                fs::create_dir(&p).map_err(|e| {
+                    format!(
+                        "could not create ~/{}: {e}",
+                        rel_to(&p, home).unwrap_or_default()
+                    )
+                })?;
+                let mode = if *part == ".ssh" || *part == ".gnupg" {
+                    0o700
+                } else {
+                    0o755
+                };
                 let _ = fs::set_permissions(&p, fs::Permissions::from_mode(mode));
             }
             Some(Entry::Dir) => {}
             Some(Entry::Link(_)) if p.is_dir() => {} // a symlinked folder here: write through it
-            Some(_) => return Err(format!("~/{} is a file here but a folder in the repo", rel_to(&p, home).unwrap_or_default())),
+            Some(_) => {
+                return Err(format!(
+                    "~/{} is a file here but a folder in the repo",
+                    rel_to(&p, home).unwrap_or_default()
+                ))
+            }
         }
     }
     let dest = home.join(rel);
@@ -472,8 +637,20 @@ pub fn write_home(rel: &str, entry: &Entry) -> KResult<()> {
                     }
                     m
                 }
-                _ if private(rel) => if exe { 0o700 } else { 0o600 },
-                _ => if exe { 0o755 } else { 0o644 },
+                _ if private(rel) => {
+                    if exe {
+                        0o700
+                    } else {
+                        0o600
+                    }
+                }
+                _ => {
+                    if exe {
+                        0o755
+                    } else {
+                        0o644
+                    }
+                }
             };
             write_atomic(&dest, data, mode).map_err(|e| e.to_string())
         }
@@ -483,6 +660,7 @@ pub fn write_home(rel: &str, entry: &Entry) -> KResult<()> {
 
 /// Store an entry in the repo's home/ (replacing whatever the repo had at that path).
 pub fn write_tree(rel: &str, entry: &Entry) -> KResult<()> {
+    tree_path(rel)?;
     let tree = &ctx().tree;
     fs::create_dir_all(tree).map_err(|e| e.to_string())?;
     let parts: Vec<&str> = rel.split('/').collect();
@@ -490,7 +668,10 @@ pub fn write_tree(rel: &str, entry: &Entry) -> KResult<()> {
     for part in &parts[..parts.len() - 1] {
         p = p.join(part);
         if is_link(&p) || p.is_file() {
-            fs::remove_file(&p).map_err(|e| e.to_string())?; // a tracked file/symlink becomes a folder
+            return Err(format!(
+                "cannot replace tracked parent {} with a folder; kit rm it first",
+                p.display()
+            ));
         }
         if !p.is_dir() {
             fs::create_dir(&p).map_err(|e| e.to_string())?;
@@ -502,7 +683,10 @@ pub fn write_tree(rel: &str, entry: &Entry) -> KResult<()> {
     }
     match entry {
         Entry::Link(t) => link_atomic(&dest, t).map_err(|e| e.to_string()),
-        Entry::File(data, m) => write_atomic(&dest, data, if m & 0o111 != 0 { 0o755 } else { 0o644 }).map_err(|e| e.to_string()),
+        Entry::File(data, m) => {
+            write_atomic(&dest, data, if m & 0o111 != 0 { 0o755 } else { 0o644 })
+                .map_err(|e| e.to_string())
+        }
         _ => Err(format!("~/{rel}: can't store a {}", entry.kind())),
     }
 }
@@ -528,7 +712,8 @@ pub fn remove_tree(rel: &str) -> KResult<()> {
 
 fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
-    for ent in fs::read_dir(src)?.flatten() {
+    for ent in fs::read_dir(src)? {
+        let ent = ent?;
         let s = ent.path();
         let d = dest.join(ent.file_name());
         let md = fs::symlink_metadata(&s)?;
@@ -547,36 +732,60 @@ pub fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
     copy_tree(src, dest)
 }
 
-pub fn backup(stamp: &str, rel: &str) {
+pub fn backup(stamp: &str, rel: &str) -> KResult<()> {
+    validate_rel(rel)?;
     let cx = ctx();
     let src = cx.home.join(rel);
     let dest = cx.backups.join(stamp).join(rel);
     let e = read_entry(&src);
-    if matches!(e, None | Some(Entry::Other) | Some(Entry::Unreadable)) {
-        return;
+    if e.is_none() {
+        return Ok(());
+    }
+    if matches!(e, Some(Entry::Other) | Some(Entry::Unreadable)) {
+        return Err(format!(
+            "cannot back up ~/{rel}: unreadable or special file"
+        ));
     }
     if let Some(p) = dest.parent() {
-        let _ = fs::create_dir_all(p);
+        fs::create_dir_all(p).map_err(|e| format!("cannot create backup: {e}"))?;
     }
     match e.unwrap() {
         Entry::Dir => {
-            let _ = copy_tree(&src, &dest);
+            copy_tree(&src, &dest).map_err(|e| e.to_string())?;
         }
         Entry::Link(t) => {
-            let _ = std::os::unix::fs::symlink(t, &dest);
+            std::os::unix::fs::symlink(t, &dest).map_err(|e| e.to_string())?;
         }
         Entry::File(b, m) => {
-            let _ = fs::write(&dest, b);
-            let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(m));
+            write_atomic(&dest, &b, m).map_err(|e| e.to_string())?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 // --------------------------------------------------------------------------- secrets
 const SECRET_NAMES: &[&str] = &[
-    "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*", ".netrc", ".git-credentials", "*token*",
-    "*secret*", "credentials*", "auth.db*", ".sgptrc", "*.kdbx", ".vault-*", ".npmrc", ".pypirc", "*.keystore",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    "id_dsa*",
+    ".netrc",
+    ".git-credentials",
+    "*token*",
+    "*secret*",
+    "credentials*",
+    "auth.db*",
+    ".sgptrc",
+    "*.kdbx",
+    ".vault-*",
+    ".npmrc",
+    ".pypirc",
+    "*.keystore",
 ];
 const SECRET_PATHS: &[&str] = &[
     ".config/gh/hosts.yml",
@@ -607,7 +816,6 @@ pub fn looks_secret_name(rel: &str) -> bool {
 
 /// Where a file seems to hold a secret ("line N"), never the secret itself.
 pub fn secret_hit(data: &[u8]) -> Option<String> {
-    let data = &data[..data.len().min(2_000_000)];
     let m = secret_re().find(data)?;
     let line = data[..m.start()].iter().filter(|&&b| b == b'\n').count() + 1;
     Some(format!("line {line}"))
@@ -631,13 +839,22 @@ pub type Synced = BTreeMap<String, String>;
 pub fn load_synced() -> Synced {
     let cx = ctx();
     if cx.synced.exists() {
-        return load_obj(&cx.synced).into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect();
+        let obj = load_obj(&cx.synced);
+        for k in obj.keys() {
+            validate_rel(k).unwrap_or_else(|e| die(&format!("synced.json: {e}")));
+        }
+        return obj
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect();
     }
     // first run on this machine (or after upgrading kit): files already identical count as synced
     let mut synced = Synced::new();
     for rel in managed(None) {
-        let Ok(src) = source_entry(&rel, &local_contexts()) else { continue };
-        let tgt = read_entry(&cx.home.join(&rel));
+        let Ok(src) = source_entry(&rel, &local_contexts()) else {
+            continue;
+        };
+        let tgt = read_home_entry(&rel);
         if let (Some(_), Some(t)) = (&src, &tgt) {
             if same(src.as_ref(), Some(t)) {
                 mark_synced(&mut synced, &rel, t);
@@ -663,24 +880,28 @@ pub fn get_base(rel: &str) -> Option<Vec<u8>> {
 
 /// Remember `e` as the version this machine and the repo last agreed on.
 pub fn mark_synced(synced: &mut Synced, rel: &str, e: &Entry) {
+    validate_rel(rel).unwrap_or_else(|e| die(&e));
     let Some(d) = digest(Some(e)) else { return };
     let p = base_path(rel);
     let fresh = synced.get(rel) != Some(&d) || !exists_or_link(&p);
-    synced.insert(rel.to_string(), d);
     if !fresh {
+        synced.insert(rel.to_string(), d);
         return;
     }
     if let Some(parent) = p.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|e| die(&format!("cannot record merge base: {e}")));
     }
     match e {
         Entry::File(b, _) => {
-            let _ = write_atomic(&p, b, 0o600);
+            write_atomic(&p, b, 0o600)
+                .unwrap_or_else(|e| die(&format!("cannot record merge base: {e}")));
         }
         _ => {
             let _ = fs::remove_file(&p);
         }
     }
+    synced.insert(rel.to_string(), d);
 }
 
 pub fn unmark_synced(synced: &mut Synced, rel: &str) {
@@ -689,7 +910,14 @@ pub fn unmark_synced(synced: &mut Synced, rel: &str) {
 }
 
 pub fn tracked_dirs() -> Vec<String> {
-    load_str_list(&ctx().dirs)
+    let dirs = load_str_list(&ctx().dirs);
+    for d in &dirs {
+        validate_rel(d).unwrap_or_else(|e| die(&format!("dirs.json: {e}")));
+        if never_track(d) || contains_kit(d) {
+            die(&format!("dirs.json: ~/{d} contains kit's own folders"));
+        }
+    }
+    dirs
 }
 
 pub fn label(code: &str) -> &'static str {
@@ -699,21 +927,29 @@ pub fn label(code: &str) -> &'static str {
         "both" => "changed on both",
         "missing" => "missing here",
         "deleted" => "deleted here",
-        "new" => "new here",
         "type" => "file vs folder",
         "conflict" => "has conflicts",
+        "delete-conflict" => "deleted here, changed in repo",
         _ => "unreadable",
     }
 }
 
 pub fn classify(rel: &str, synced: &Synced) -> KResult<Option<&'static str>> {
     let src = source_entry(rel, &local_contexts())?;
-    let tgt = read_entry(&ctx().home.join(rel));
+    let tgt = read_home_entry(rel);
     if !matches!(src, Some(Entry::File(..)) | Some(Entry::Link(_))) {
         return Ok(None);
     }
     Ok(match &tgt {
-        None => Some(if synced.contains_key(rel) { "deleted" } else { "missing" }),
+        None => Some(if let Some(last) = synced.get(rel) {
+            if digest(src.as_ref()).as_ref() != Some(last) {
+                "delete-conflict"
+            } else {
+                "deleted"
+            }
+        } else {
+            "missing"
+        }),
         Some(Entry::Dir) | Some(Entry::Other) => Some("type"),
         Some(Entry::Unreadable) => Some("unreadable"),
         _ if same(src.as_ref(), tgt.as_ref()) => None,
@@ -723,39 +959,16 @@ pub fn classify(rel: &str, synced: &Synced) -> KResult<Option<&'static str>> {
             Some(last) => {
                 let here = digest(tgt.as_ref()).as_ref() != Some(last);
                 let repo = digest(src.as_ref()).as_ref() != Some(last);
-                Some(if here && repo { "both" } else if here { "here" } else { "repo" })
+                Some(if here && repo {
+                    "both"
+                } else if here {
+                    "here"
+                } else {
+                    "repo"
+                })
             }
         },
     })
-}
-
-/// Files in folders added whole that aren't tracked yet (not ignored, not secret-looking).
-pub fn new_files(prefixes: Option<&[String]>) -> Vec<String> {
-    let home = &ctx().home;
-    let tracked: BTreeSet<String> = managed(None).iter().map(|r| nfc(r)).collect();
-    let mut found: BTreeSet<String> = BTreeSet::new();
-    for d in tracked_dirs() {
-        if let Some(ps) = prefixes {
-            if !ps.iter().any(|p| under(&d, p) || under(p, &d)) {
-                continue;
-            }
-        }
-        let base = home.join(&d);
-        if !is_real_dir(&base) {
-            continue;
-        }
-        let mut entries = Vec::new();
-        walk_entries(&base, &d, &mut entries, &mut |rel, _| ignored_here(rel) || tracked.contains(&nfc(rel)));
-        for rel in entries {
-            if tracked.contains(&nfc(&rel)) || ignored_here(&rel) || looks_secret_name(&rel) {
-                continue;
-            }
-            if matches!(read_entry(&home.join(&rel)), Some(Entry::File(..)) | Some(Entry::Link(_))) {
-                found.insert(rel);
-            }
-        }
-    }
-    found.into_iter().filter(|f| prefixes.is_none_or(|ps| ps.iter().any(|p| under(f, p)))).collect()
 }
 
 /// [(code, rel)] for everything that differs between this machine and the repo.
@@ -765,26 +978,35 @@ pub fn file_changes(prefixes: Option<&[String]>, synced: &Synced) -> Vec<(&'stat
         if ignored_here(&rel) {
             continue;
         }
-        if let Ok(Some(code)) = classify(&rel, synced) {
-            out.push((code, rel));
+        match classify(&rel, synced) {
+            Ok(Some(code)) => out.push((code, rel)),
+            Ok(None) => {}
+            Err(e) => fail(&e),
         }
     }
-    out.extend(new_files(prefixes).into_iter().map(|r| ("new", r)));
+    // Folder metadata groups tracked files; it never enrolls new files implicitly.
+    let _ = tracked_dirs();
     out
 }
 
 pub fn refresh_synced(synced: &mut Synced, prefixes: Option<&[String]>) {
     let cx = ctx();
     for rel in managed(prefixes) {
-        let Ok(src) = source_entry(&rel, &local_contexts()) else { continue };
-        let tgt = read_entry(&cx.home.join(&rel));
+        let Ok(src) = source_entry(&rel, &local_contexts()) else {
+            continue;
+        };
+        let tgt = read_home_entry(&rel);
         if let (Some(_), Some(t)) = (&src, &tgt) {
             if same(src.as_ref(), Some(t)) {
                 mark_synced(synced, &rel, t);
             }
         }
     }
-    let gone: Vec<String> = synced.keys().filter(|rel| !exists_or_link(&cx.tree.join(rel))).cloned().collect();
+    let gone: Vec<String> = synced
+        .keys()
+        .filter(|rel| !exists_or_link(&cx.tree.join(rel)))
+        .cloned()
+        .collect();
     for rel in gone {
         unmark_synced(synced, &rel);
     }
@@ -800,7 +1022,7 @@ pub fn scope(paths: &[String]) -> Option<Vec<String>> {
     let tracked = managed(None);
     let dirs = tracked_dirs();
     for p in &prefixes {
-        if !tracked.iter().any(|t| under(t, p)) && !dirs.iter().any(|d| under(p, d)) {
+        if !tracked.iter().any(|t| under(t, p)) && !dirs.iter().any(|d| p == d) {
             fail(&format!("~/{p} is not tracked (kit add it first)"));
         }
     }
@@ -810,7 +1032,12 @@ pub fn scope(paths: &[String]) -> Option<Vec<String>> {
 // --------------------------------------------------------------------------- repo state
 pub fn repo_busy() -> Option<&'static str> {
     let g = ctx().source.join(".git");
-    for (marker, what) in [("rebase-merge", "rebase"), ("rebase-apply", "rebase"), ("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick")] {
+    for (marker, what) in [
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("MERGE_HEAD", "merge"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ] {
         if g.join(marker).exists() {
             return Some(what);
         }
@@ -832,13 +1059,25 @@ pub fn hidden_by_gitignore() -> Vec<String> {
     if !cx.source.join(".git").exists() || !is_real_dir(&cx.tree) {
         return vec![];
     }
-    let r = git(&["ls-files", "--others", "--ignored", "--exclude-standard", "--", "home"]);
-    r.stdout.lines().filter_map(|l| l.strip_prefix("home/").map(String::from)).collect()
+    let r = git(&[
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--",
+        "home",
+    ]);
+    r.stdout
+        .split('\0')
+        .filter_map(|l| l.strip_prefix("home/").map(String::from))
+        .collect()
 }
 
 pub fn has_conflict_markers(data: &[u8]) -> bool {
     static RE: OnceLock<BRegex> = OnceLock::new();
-    RE.get_or_init(|| BRegex::new(r"(?m)^(<{7} |>{7} )").unwrap()).is_match(data)
+    RE.get_or_init(|| BRegex::new(r"(?m)^(<{7} |>{7} )").unwrap())
+        .is_match(data)
 }
 
 pub fn is_binary(data: &[u8]) -> bool {

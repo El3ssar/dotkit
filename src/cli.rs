@@ -1,4 +1,4 @@
-//! The command line: eight commands.
+//! The command line.
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 pub struct Args {
@@ -9,14 +9,29 @@ impl Args {
     pub fn new(m: ArgMatches) -> Self {
         Args { m }
     }
+    pub fn subcommand(&self) -> Option<(String, Self)> {
+        self.m
+            .subcommand()
+            .map(|(name, args)| (name.into(), Self::new(args.clone())))
+    }
     pub fn flag(&self, id: &str) -> bool {
-        self.m.try_get_one::<bool>(id).ok().flatten().copied().unwrap_or(false)
+        self.m
+            .try_get_one::<bool>(id)
+            .ok()
+            .flatten()
+            .copied()
+            .unwrap_or(false)
     }
     pub fn one(&self, id: &str) -> Option<String> {
         self.m.try_get_one::<String>(id).ok().flatten().cloned()
     }
     pub fn many(&self, id: &str) -> Vec<String> {
-        self.m.try_get_many::<String>(id).ok().flatten().map(|v| v.cloned().collect()).unwrap_or_default()
+        self.m
+            .try_get_many::<String>(id)
+            .ok()
+            .flatten()
+            .map(|v| v.cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -31,15 +46,24 @@ how it goes:
 kit help <command> for details.";
 
 fn cmd(name: &'static str, about: &'static str, examples: &'static str) -> Command {
-    Command::new(name).about(about).after_help(format!("examples: {examples}"))
+    Command::new(name)
+        .about(about)
+        .after_help(format!("examples: {examples}"))
 }
 
 fn flag(id: &'static str, help: &'static str) -> Arg {
-    Arg::new(id).long(id.replace('_', "-")).action(ArgAction::SetTrue).help(help)
+    Arg::new(id)
+        .long(id.replace('_', "-"))
+        .action(ArgAction::SetTrue)
+        .help(help)
 }
 
 fn spec(id: &'static str, help: &'static str) -> Arg {
-    Arg::new(id).long(id).value_name("SPEC").help(help).help_heading("For tools")
+    Arg::new(id)
+        .long(id)
+        .value_name("SPEC")
+        .help(help)
+        .help_heading("For tools")
 }
 
 fn things(required: bool, name: &'static str) -> Arg {
@@ -71,11 +95,24 @@ pub fn build_cli() -> Command {
             )
             .arg(things(true, "FILE|TOOL"))
             .arg(flag("force", "even if it's ignored or looks like a secret"))
+            .arg(flag("upgrade", "check and update this tracked tool through its installed provider").conflicts_with_all(["mac", "linux", "fallback", "bin", "force", "no_servers"]))
             .arg(flag("no_servers", "keep it off servers (kit push)"))
             .arg(spec("mac", "how to install it on a Mac: brew:…, cask:…, cargo:…, cmd:<shell>"))
             .arg(spec("linux", "how to install it on Linux and servers: a mise spec, e.g. aqua:owner/repo"))
             .arg(spec("fallback", "build it from source where no download runs, e.g. cargo:<crate>"))
             .arg(Arg::new("bin").long("bin").value_name("NAME").help("its command name, if different").help_heading("For tools")),
+        )
+        .subcommand(
+            cmd("packages", "browse and manage the tools tracked for sync", "kit packages · kit packages list · kit packages update eza · kit packages resolve")
+                .visible_alias("pkg")
+                .arg(flag("json", "print the full package manifest, including kit's built-in tools"))
+                .arg(flag("tui", "open the interactive package manager (requires a terminal)"))
+                .subcommand(Command::new("list").about("list packages, recipes, installation state and server scope"))
+                .subcommand(Command::new("update").about("check selected installed tools and update only when newer versions exist").arg(flag("check", "check versions without installing or changing recipes")).arg(Arg::new("names").num_args(1..).required(true)))
+                .subcommand(Command::new("remove").about("stop syncing selected tools; leave installed programs untouched").arg(Arg::new("names").num_args(1..).required(true)))
+                .subcommand(Command::new("resolve").about("generate missing Linux recipes for review; does not install tools").arg(Arg::new("names").num_args(0..)))
+                .subcommand(Command::new("servers").about("include selected tools in kit push").arg(Arg::new("names").num_args(1..).required(true)))
+                .subcommand(Command::new("local").about("exclude selected tools from kit push").arg(Arg::new("names").num_args(1..).required(true)))
         )
         .subcommand(
             cmd("rm", "stop tracking files, folders or tools (nothing is deleted)", "kit rm ~/.config/foo · kit rm lazygit")
@@ -95,8 +132,8 @@ pub fn build_cli() -> Command {
         .subcommand(cmd(
             "sync",
             "back up what you saved, get what other machines saved (merging both)",
-            "kit sync",
-        ))
+            "kit sync · kit sync --trust",
+        ).arg(flag("trust", "approve pending scripts, external checkouts and command recipes from this repo")))
         .subcommand(
             cmd(
                 "undo",

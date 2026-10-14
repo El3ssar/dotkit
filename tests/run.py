@@ -35,8 +35,8 @@ BASE = Path(os.environ.get("KIT_TEST_TMP") or
 REAL_HOME = os.path.realpath(os.path.expanduser("~"))
 PLAT = "mac" if platform.system() == "Darwin" else "linux"
 OTHER = "linux" if PLAT == "mac" else "mac"
-STUBS = ["brew", "launchctl", "clang", "cargo", "mise", "gh", "delta", "bat", "ssh", "rsync", "zsh"]
-COMMANDS = ["init", "add", "rm", "status", "save", "sync", "undo", "push"]
+STUBS = ["brew", "launchctl", "clang", "cargo", "mise", "gh", "delta", "bat", "ssh", "rsync", "zsh", "nvim"]
+COMMANDS = ["init", "add", "rm", "status", "save", "sync", "undo", "push", "packages"]
 ZSH_SITE = Path("/opt/homebrew/share/zsh/site-functions/_kit")
 KIT: list = []
 VERBOSE = False
@@ -94,6 +94,8 @@ class Sandbox:
             self.make_stub(name_)
         self.stub("zsh", code=0)   # `zsh -fc 'print -l $fpath'` prints nothing: no real fpath dir is used
         self.machines = {}
+        for formula in ("bat", "git-delta", "neovim"):
+            (self.root / "Cellar" / formula).mkdir(parents=True)
 
     def make_stub(self, name):
         p = self.fakebin / name
@@ -101,6 +103,7 @@ class Sandbox:
 {{ printf '%s' {shlex.quote(name)}; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; }} >> {shlex.quote(str(self.log))}
 cfg={shlex.quote(str(self.stubcfg))}
 if [ -f "$cfg/{name}.sh" ]; then exec /bin/sh "$cfg/{name}.sh" "$@"; fi
+if [ {shlex.quote(name)} = mise ] && [ "${{1:-}}" = --version ]; then echo mise-test; exit 0; fi
 code=1
 if [ -f "$cfg/{name}.code" ]; then code=$(cat "$cfg/{name}.code"); fi
 exit "$code"
@@ -117,6 +120,8 @@ exit "$code"
 
     def unstub(self, name):
         (self.fakebin / name).unlink()
+        formula = {"bat":"bat", "delta":"git-delta", "nvim":"neovim"}.get(name)
+        if formula: shutil.rmtree(self.root / "Cellar" / formula, ignore_errors=True)
 
     def calls(self, name=None):
         lines = self.log.read_text().splitlines()
@@ -189,6 +194,21 @@ class Machine:
         self.src = self.home / ".local/share/kit"
         self.state = self.home / ".local/state/kit"
         self.envvars = sb.env(self.home)
+        kit = self.home / ".local/kit"
+        (kit / "bin").mkdir(parents=True)
+        (kit / "opt/zsh/bin").mkdir(parents=True)
+        private_mise = kit / "bin/mise"
+        private_mise.write_text("#!/bin/bash\n" +
+            'if [ "${1:-}" = --version ]; then echo mise-test; exit 0; fi\n' +
+            'if [ "${1:-}" = reshim ]; then exit 0; fi\n' +
+            f"{shlex.quote(str(sb.fakebin / 'mise'))} \"$@\" || exit $?\n" +
+            'if [ "${1:-}" = install ] || [ "${1:-}" = reshim ]; then\n' +
+            '  mkdir -p "$HOME/.local/kit/mise/shims"\n' +
+            '  for bin in nvim bat delta; do printf "#!/bin/sh\\nexit 0\\n" > "$HOME/.local/kit/mise/shims/$bin"; chmod +x "$HOME/.local/kit/mise/shims/$bin"; done\n' +
+            '  while IFS=$\'\\t\' read -r name bin spec fallback; do [ -n "$bin" ] || continue; printf "#!/bin/sh\\nexit 0\\n" > "$HOME/.local/kit/mise/shims/$bin"; chmod +x "$HOME/.local/kit/mise/shims/$bin"; done < "$HOME/.local/kit/payload/packages.list"\n' +
+            'fi\n')
+        private_mise.chmod(0o755)
+        os.symlink(sb.fakebin / "zsh", kit / "opt/zsh/bin/zsh")
 
     # --- running kit
     def kit(self, *args, code=0, env=None, cwd=None, input=None, timeout=60):
@@ -655,7 +675,7 @@ def add_tool_bin_mac_linux(sb):
     p = pkgs(m)["ripgrep"]
     ok(p.get("linux") == "aqua:BurntSushi/ripgrep@1.2.3" and p.get("bin") == "rg", p)
     m.kit("add", "cask:kitty")
-    ok(pkgs(m)["kitty"] == {"mac": "cask:kitty"}, pkgs(m)["kitty"])
+    ok(pkgs(m)["kitty"] == {"mac": "cask:kitty", "linux": "system:kitty"}, pkgs(m)["kitty"])
     m.kit("add", "--mac", "brew:foo", "--linux", "aqua:o/foo@1.0", "foo")
     ok(pkgs(m)["foo"] == {"mac": "brew:foo", "linux": "aqua:o/foo@1.0"}, pkgs(m)["foo"])
     m.kit("add", "--linux", "not a spec", "bar", code=1)
@@ -764,8 +784,8 @@ def rm_inside_tracked_folder_writes_global_ignore(sb):
 def rm_untracked_file_in_tracked_folder(sb):
     m = setup(sb, {".config/app/a": "a\n"}, add=[".config/app"])
     m.write(".config/app/junk", "j\n")
-    r = m.kit("rm", "~/.config/app/junk")
-    has(r.out, "won't show up")
+    r = m.kit("rm", "~/.config/app/junk", code=1)
+    has(r.err, "not tracked")
     hasnt(m.kit("status", "-v", code=None).out, "junk")
     ok(m.exists(".config/app/junk"))
 
@@ -775,6 +795,9 @@ def rm_escapes_patterns(sb):
     m = setup(sb, {".config/app/a": "a\n"}, add=[".config/app"])
     for n in ("weird[1].txt", "weird1.txt", "a*b.txt", "axxb.txt"):
         m.write(f".config/app/{n}", "n\n")
+    m.kit("add", "~/.config/app")
+    for n in ("weird1.txt", "axxb.txt"):
+        m.write(f".config/app/{n}", "changed\n")
     m.kit("rm", "~/.config/app/weird[1].txt", "~/.config/app/a*b.txt")
     r = m.kit("status", "-v", code=None)
     has(r.out, "~/.config/app/weird1.txt", "~/.config/app/axxb.txt")
@@ -868,11 +891,15 @@ def status_deleted_here(sb):
 
 
 @test
-def status_new_here(sb):
+def status_ignores_untracked_files_in_added_folder(sb):
     m = setup(sb, {".config/app/a": "a\n"}, add=[".config/app"])
     m.write(".config/app/b", "b\n")
-    r = check_status(m, "new here", "~/.config/app/b")
-    has(r.out, "kit rm")
+    r = m.kit("status", "-v")
+    hasnt(r.out, "new here", "~/.config/app/b")
+    has(m.kit("save").out, "nothing to save")
+    ok(not m.repo_has("home/.config/app/b"))
+    m.kit("add", "~/.config/app/b")
+    ok(m.repo_has("home/.config/app/b"))
 
 
 @test
@@ -913,6 +940,7 @@ def status_unreadable(sb):
 @test
 def status_in_sync_and_executable_bit(sb):
     m = setup(sb, {".local/bin/t": "#!/bin/sh\n"}, add=[".local/bin/t"])
+    m.sync()
     r = m.kit("status", "~/.local/bin/t")
     has(r.out, "in sync")
     (m.home / ".local/bin/t").chmod(0o755)
@@ -922,6 +950,7 @@ def status_in_sync_and_executable_bit(sb):
 @test
 def status_groups_big_folders(sb):
     m = setup(sb, {f".config/app/f{i}": "a\n" for i in range(5)}, add=[".config/app"])
+    m.sync()
     for i in range(5):
         m.write(f".config/app/f{i}", "changed\n")
     m.write(".zshrc", "z\n")
@@ -947,6 +976,7 @@ def status_three_files_not_grouped(sb):
 @test
 def status_path_scope(sb):
     m = setup(sb, {".zshrc": "a\n", ".bashrc": "b\n"}, add=[".zshrc", ".bashrc"])
+    m.sync()
     m.write(".bashrc", "changed\n")
     r = m.kit("status", "~/.zshrc")
     has(r.out, "in sync")
@@ -969,6 +999,10 @@ def status_lookalike_prefix_folders(sb):
               add=[".config/app", ".config/application"])
     for i in range(4):
         m.write(f".config/application/n{i}", "n\n")
+    m.kit("add", "~/.config/application")
+    m.sync()
+    for i in range(4):
+        m.write(f".config/application/n{i}", "changed\n")
     r = m.kit("status", code=None)
     has(r.out, "~/.config/application/ (4 files)")
     hasnt(r.out, "~/.config/app/ (")
@@ -1010,6 +1044,7 @@ def status_missing_required_tools(sb):
     hasnt(m.kit("status").out, "Missing")
     sb.unstub("delta")
     sb.unstub("brew" if PLAT == "mac" else "mise")
+    if PLAT == "linux": (m.home / ".local/kit/bin/mise").unlink()
     r = m.kit("status", code=None)
     line = next((l for l in r.out.splitlines() if "Missing" in l), "")
     ok(line, "no 'Missing:' line")
@@ -1127,12 +1162,12 @@ def status_file_uses_delta_on_a_terminal(sb):
 
 
 @test
-def status_file_new_here(sb):
+def status_untracked_file_requires_add(sb):
     m = setup(sb, {".config/app/a": "a\n"}, add=[".config/app"])
     m.write(".config/app/n", "brand new\n")
-    r = m.kit("status", "~/.config/app/n")
-    has(r.out, "new here")
-    ok(any(l[1:] == "brand new" for l in diff_lines(r.out)), "new file's line isn't in the patch")
+    r = m.kit("status", "~/.config/app/n", code=1)
+    has(r.err, "not tracked")
+    hasnt(r.out, "brand new", "new here")
 
 
 @test
@@ -1175,18 +1210,19 @@ def save_copies_changes_without_committing(sb):
     ok(m.repo_read("home/.zshrc") == "b\n")
     ok(m.head() == head, "save made a commit")
     ok(m.git("status", "--porcelain").stdout.strip() != "", "save left nothing to commit")
-    has(m.kit("status", "~/.zshrc").out, "in sync")
+    has(m.kit("status", "~/.zshrc").out, "not backed up", "~/.zshrc")
     has(m.kit("save").out, "nothing to save")
 
 
 @test
-def save_new_and_deleted_files(sb):
+def save_ignores_new_files_and_saves_tracked_deletions(sb):
     m = setup(sb, {".config/app/a": "a\n", ".config/app/b": "b\n"}, add=[".config/app"])
     m.write(".config/app/c", "c\n")
     (m.home / ".config/app/b").unlink()
     r = m.kit("save")
-    has(r.out, "2 change(s) saved", "added", ".config/app/c", "removed", ".config/app/b")
-    ok(m.repo_has("home/.config/app/c") and not m.repo_has("home/.config/app/b"))
+    has(r.out, "1 change(s) saved", "removed", ".config/app/b")
+    hasnt(r.out, ".config/app/c")
+    ok(not m.repo_has("home/.config/app/c") and not m.repo_has("home/.config/app/b"))
 
 
 @test
@@ -1270,7 +1306,7 @@ def sync_commits_and_warns_without_remote(sb):
 @test
 def sync_refuses_secrets(sb):
     m = setup(sb, {".config/app/env": f"t={TOKEN}\n"})
-    m.kit("add", "--force", "~/.config/app/env")
+    m.repo_write("home/.config/app/env", TOKEN + "\n")
     r = m.kit("sync", code=1)
     has(r.err, "secret", "config/app/env")
     hasnt(r.both, TOKEN)
@@ -1933,8 +1969,8 @@ def push_without_host_pushes_every_server(sb):
     sb.stub("ssh", code=0)
     sb.stub("rsync", code=0)
     m.kit("push")
-    rs = sb.calls("rsync")
-    ok(any("alpha:" in c for c in rs) and any("beta:" in c for c in rs), sb.calls())
+    uploads = [c for c in sb.calls("ssh") if "tar -xzf" in c]
+    ok(any("alpha " in c for c in uploads) and any("beta " in c for c in uploads), sb.calls())
 
 
 @test
@@ -1950,11 +1986,11 @@ def push_first_time_no_confirmation(sb):
     has(r.out, "not sent to servers")
     ok("box" in m.json("remotes.json"))
     ok(any("box" in c and "mkdir" in c for c in sb.calls("ssh")), sb.calls())
-    ok(any("box:" in c for c in sb.calls("rsync")), sb.calls())
+    ok(any("box " in c and "tar -xzf" in c for c in sb.calls("ssh")), sb.calls())
     payload = m.state / "payload"
-    ok((payload / "config/app/a").read_text() == "a\n", "payload lacks config/app/a")
-    ok(not (payload / "config/kitty").exists(), "[remote] file was sent")
-    ok(not any(p.name == ".zshrc" for p in payload.rglob("*")), ".zshrc was sent")
+    ok((payload / "home/.config/app/a").read_text() == "a\n", "payload lacks config/app/a")
+    ok(not (payload / "home/.config/kitty").exists(), "[remote] file was sent")
+    ok((payload / "home/.zshrc").read_text() == "z\n", "shell rc was not sent")
     has((payload / "mise.toml").read_text(), "aqua:sharkdp/bat")
 
 
@@ -2004,7 +2040,7 @@ def help_commands(text):
 
 
 @test
-def cli_help_shows_exactly_eight_commands(sb):
+def cli_help_shows_public_commands(sb):
     m = sb.machine()
     r = m.kit("--help")
     cmds = help_commands(r.out)
@@ -2215,6 +2251,653 @@ def state_migrates_old_repo_folder(sb):
     m.kit("undo", "20200101-000000")
     ok(m.read(".zshrc") == "old\n")
 
+# =========================================================================== regression coverage
+@test
+def pulled_code_requires_approval_on_every_retry(sb):
+    a, b, _ = two_machines(sb, {".zshrc": "base\n"})
+    a.repo_write("scripts/new.sh", 'touch "$HOME/ran-new"\n')
+    a.sync()
+    for _ in range(2):
+        b.kit("sync", code=1)
+        ok(not b.exists("ran-new"), "unapproved script executed")
+    b.kit("sync", "--trust", code=None if PLAT == "linux" else 0)
+    ok(b.exists("ran-new"), "approved script did not run")
+
+
+@test
+def pulled_commands_are_gated_with_scripts(sb):
+    a, b, _ = two_machines(sb, {".zshrc": "base\n"})
+    a.repo_write("packages.json", json.dumps({"probe": {PLAT: 'cmd:touch "$HOME/ran-command"', "bin": "missing-probe"}}))
+    a.sync(code=None)
+    for _ in range(2):
+        b.kit("sync", code=1)
+        ok(not b.exists("ran-command"), "unapproved recipe executed")
+
+
+@test
+def cloned_scripts_require_explicit_approval(sb):
+    a = setup(sb)
+    a.repo_write("scripts/probe.sh", 'touch "$HOME/cloned-code"\n')
+    bare = sb.bare(); a.kit("init", str(bare)); a.sync()
+    b = sb.machine("clone"); b.kit("init", str(bare))
+    b.kit("sync", code=1)
+    ok(not b.exists("cloned-code"))
+
+
+@test
+def undo_aborts_when_backup_cannot_be_created(sb):
+    m = setup(sb, {".zshrc": "base\n"}, add=[".zshrc"])
+    m.write(".zshrc", "valuable\n")
+    (m.state / "backups").write_text("blocks directory")
+    m.kit("undo", "~/.zshrc", code=1)
+    ok(m.read(".zshrc") == "valuable\n", "original overwritten without backup")
+
+
+@test
+def failed_restore_keeps_original_backup(sb):
+    m = setup(sb)
+    stamp = m.state / "backups/20200101-000000"
+    stamp.mkdir(parents=True)
+    os.mkfifo(stamp / "unsupported")
+    m.kit("undo", stamp.name, code=1)
+    ok(stamp.exists(), "failed restore deleted the backup")
+
+
+@test
+def undo_restores_file_over_directory_with_backup(sb):
+    m = setup(sb, {".zshrc": "base\n"}, add=[".zshrc"])
+    m.write(".zshrc", "valuable\n"); m.kit("undo", "~/.zshrc")
+    stamp = next((m.state / "backups").iterdir()).name
+    (m.home / ".zshrc").unlink(); m.write(".zshrc/nested", "keep-directory\n")
+    m.kit("undo", stamp)
+    ok(m.read(".zshrc") == "valuable\n")
+    ok(any(p.read_text() == "keep-directory\n" for p in (m.state / "backups").rglob("nested")))
+
+
+@test
+def predictable_temp_symlink_cannot_clobber_another_file(sb):
+    m = setup(sb, {".zshrc": "base\n"}, add=[".zshrc"])
+    m.write(".zshrc", "mine\n"); victim = m.write("victim", "valuable\n")
+    os.symlink(victim, m.home / "..zshrc.kit-tmp")
+    m.kit("undo", "~/.zshrc")
+    ok(victim.read_text() == "valuable\n")
+    ok(not (m.home / ".zshrc").is_symlink())
+
+
+@test
+def dirs_metadata_cannot_escape_home(sb):
+    m = setup(sb)
+    outside = sb.root / "outside"; outside.mkdir(); (outside / "config").write_text("private\n")
+    m.repo_write("dirs.json", json.dumps([os.path.relpath(outside, m.home)]))
+    r = m.kit("save", code=1)
+    has(r.err, "dirs.json", "invalid")
+    ok((outside / "config").read_text() == "private\n")
+
+
+@test
+def forced_secret_override_is_tied_to_content(sb):
+    m = setup(sb, {".config/env": TOKEN + "\n"})
+    m.kit("add", "--force", "~/.config/env"); m.sync()
+    m.repo_write("home/.config/env", TOKEN + "changed\n")
+    m.kit("sync", code=1)
+
+
+@test
+def secrets_after_two_megabytes_are_detected(sb):
+    m = setup(sb, {".config/large": b"x" * 2_000_001 + b"\n" + TOKEN.encode()})
+    m.kit("add", "~/.config/large", code=1)
+    ok(not m.repo_has("home/.config/large"))
+
+
+@test
+def reconcile_preserves_unrelated_new_tracked_files(sb):
+    a, b, _ = two_machines(sb, {".zshrc": MERGE_BASE})
+    a.write(".zshrc", "one\ntwo\nTHREE-a\nfour\nfive\n"); a.kit("save"); a.sync()
+    b.write(".zshrc", "one\ntwo\nTHREE-b\nfour\nfive\n"); b.kit("save")
+    b.write(".newconfig", "valuable\n"); b.kit("add", "~/.newconfig")
+    b.kit("sync", code=1)
+    ok(b.repo_read("home/.newconfig") == "valuable\n", "unrelated addition untracked")
+    ok(b.git("for-each-ref", "refs/kit/recovery").stdout.strip(), "no recovery ref")
+
+
+@test
+def saving_delete_vs_remote_edit_requires_force(sb):
+    m = setup(sb, {".zshrc": "base\n"}, add=[".zshrc"])
+    (m.home / ".zshrc").unlink(); m.repo_write("home/.zshrc", "remote-edit\n")
+    m.kit("save", code=1)
+    ok(m.repo_read("home/.zshrc") == "remote-edit\n")
+    m.kit("save", "--force")
+    ok(not m.repo_has("home/.zshrc"))
+
+
+@test
+def tracked_login_hooks_are_not_saved(sb):
+    m = setup(sb, {".zshrc": "original\n"}, add=[".zshrc"])
+    m.sync()
+    block = '# >>> kit: generated hook >>>\nignore-this\n# <<< kit <<<\n'
+    m.write(".zshrc", block + "original\n")
+    has(m.kit("status", "~/.zshrc").out, "in sync")
+    m.kit("save")
+    ok(m.repo_read("home/.zshrc") == "original\n")
+
+
+@test
+def package_registry_infers_command_name(sb):
+    m = setup(sb)
+    sb.stub("mise", script='''case "$1" in
+ registry) echo '[{"short":"ripgrep","backends":["aqua:BurntSushi/ripgrep"],"bins":["rg"]}]';;
+ latest) echo 15.2.0;;
+esac
+exit 0
+''')
+    m.kit("add", "ripgrep")
+    p = pkgs(m)["ripgrep"]
+    ok(p["bin"] == "rg" and p["linux"] == "aqua:BurntSushi/ripgrep@15.2.0", p)
+
+
+@test
+def legacy_cargo_recipe_gets_linux_equivalent(sb):
+    m = setup(sb)
+    sb.stub("mise", script=MISE_STUB)
+    sb.stub("cargo", code=0)
+    m.kit("add", "cargo:portable")
+    ok(pkgs(m)["portable"]["linux"] == "cargo:portable@1.2.3")
+
+
+@test
+def invalid_recipe_does_not_mutate_existing_package(sb):
+    m = setup(sb); sb.stub("mise", script=MISE_USE_OK)
+    m.kit("add", "aqua:o/tool@1.0"); before = pkgs(m)
+    m.kit("add", "tool", "--linux", "not-a-recipe", code=1)
+    ok(pkgs(m) == before)
+
+
+@test
+def push_payload_reports_missing_cli_recipes(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"unportable": {"mac": "cmd:osascript Mac-only"}}))
+    sb.stub("ssh", code=0)
+    m.kit("push", "box")
+    has((m.state / "payload/packages.list").read_text(), "unportable", "missing:")
+
+
+@test
+def forced_ignored_file_is_applied_on_another_machine(sb):
+    a = setup(sb, {"sample.bak": "forced\n"})
+    a.kit("add", "--force", "--no-servers", "~/sample.bak")
+    bare = sb.bare(); a.kit("init", str(bare)); a.sync()
+    b = sb.machine("other"); b.kit("init", str(bare)); b.sync()
+    ok(b.read("sample.bak") == "forced\n")
+    sb.stub("ssh", code=0); a.kit("push", "box")
+    ok(not (a.state / "payload/home/sample.bak").exists(), "force bypassed no-servers")
+
+
+@test
+def invalid_rule_regex_is_a_visible_error(sb):
+    m = setup(sb, {".zshrc": "base\n"}, add=[".zshrc"])
+    m.repo_write("rules.json", json.dumps([{"path":".zshrc", "on":[PLAT], "regex":[["[", "x"]]}]))
+    r = m.kit("status", code=1)
+    has(r.err, "rules.json", "invalid regex")
+
+
+@test
+def reconciliation_preserves_unrelated_saved_deletion(sb):
+    a, b, _ = two_machines(sb, {".zshrc":MERGE_BASE, ".obsolete":"old\n"})
+    a.write(".zshrc", "one\ntwo\nTHREE-a\nfour\nfive\n"); a.kit("save"); a.sync()
+    b.write(".zshrc", "one\ntwo\nTHREE-b\nfour\nfive\n")
+    (b.home / ".obsolete").unlink(); b.kit("save")
+    b.kit("sync", code=1)
+    ok(not b.repo_has("home/.obsolete"), "saved deletion was resurrected")
+
+
+@test
+def reconciliation_merges_independent_package_keys(sb):
+    a, b, _ = two_machines(sb, {".zshrc":MERGE_BASE})
+    a.repo_write("packages.json", json.dumps({"alpha":{"mac":"brew:alpha"}}, indent=2))
+    a.write(".zshrc", "one\ntwo\nTHREE-a\nfour\nfive\n"); a.kit("save"); a.sync(code=None)
+    b.repo_write("packages.json", json.dumps({"beta":{"mac":"brew:beta"}}, indent=2))
+    b.write(".zshrc", "one\ntwo\nTHREE-b\nfour\nfive\n"); b.kit("save")
+    b.kit("sync", code=1)
+    ok(set(pkgs(b)) == {"alpha", "beta"}, pkgs(b))
+
+
+@test
+def package_version_change_is_installed_even_if_binary_exists(sb):
+    if PLAT != "mac": return
+    m = setup(sb); sb.stub("mise", script=MISE_USE_OK)
+    m.kit("add", "aqua:o/probe@1.0")
+    sb.stub("probe", code=0)
+    m.kit("add", "aqua:o/probe@2.0")
+    ok(any('mise use -g aqua:o/probe@2.0' == c for c in sb.calls('mise')), sb.calls())
+
+
+@test
+def brew_recipe_accepts_existing_binary_from_another_manager(sb):
+    if PLAT != "mac": return
+    m = setup(sb); sb.stub("brew", code=0); sb.stub("probe", code=0)
+    m.kit("add", "probe", "--mac", "brew:probe", "--linux", "aqua:o/probe@1.0")
+    ok("brew install probe" not in sb.calls("brew"), sb.calls())
+
+
+@test
+def cask_detection_uses_reported_brew_prefix(sb):
+    if PLAT != "mac": return
+    m = setup(sb); prefix=sb.root/"actual-prefix"; (prefix/"Caskroom/foo").mkdir(parents=True)
+    sb.stub("brew", script=f'case "$1" in --prefix) echo {shlex.quote(str(prefix))};; *) exit 1;; esac\n')
+    m.repo_write("packages.json", json.dumps({"foo":{"mac":"cask:foo"}}))
+    hasnt(m.kit("status").out, "Tools not installed here:")
+
+
+@test
+def status_recognizes_cargo_binaries_without_kit_install_records(sb):
+    m = setup(sb)
+    packages = {}
+    for name, binary in (("git-delta", "delta"), ("ripgrep", "rg"), ("skim", "sk"),
+                         ("eza", "eza"), ("bookokrat", "bookokrat"), ("just", "just"),
+                         ("mcat", "mcat"), ("starship", "starship"), ("tokei", "tokei"),
+                         ("zellij", "zellij"), ("zoxide", "zoxide")):
+        m.write(f".cargo/bin/{binary}", "#!/bin/sh\nexit 0\n")
+        (m.home / ".cargo/bin" / binary).chmod(0o755)
+        packages[name] = {PLAT: f"cargo:{name}"}
+    packages["delta"] = {PLAT: "brew:git-delta" if PLAT == "mac" else "aqua:dandavison/delta@1"}
+    m.repo_write("packages.json", json.dumps(packages))
+    # No Cargo bins on PATH, no Cellar delta, and deliberately stale kit records.
+    sb.unstub("delta")
+    (m.state / "packages-installed.json").write_text(json.dumps({"eza": "cargo:eza@old"}))
+    r = m.kit("status")
+    hasnt(r.out, "Tools not installed here:")
+    (m.home / ".cargo/bin/eza").unlink()
+    has(m.kit("status").out, "Tools not installed here: eza")
+
+
+@test
+def status_recognizes_custom_cargo_home(sb):
+    m = setup(sb)
+    cargo_home = m.home / "custom-cargo"
+    m.write("custom-cargo/bin/probe", "#!/bin/sh\nexit 0\n")
+    (cargo_home / "bin/probe").chmod(0o755)
+    m.repo_write("packages.json", json.dumps({"probe": {PLAT: "cargo:probe"}}))
+    hasnt(m.kit("status", env={"CARGO_HOME": str(cargo_home)}).out, "Tools not installed here:")
+    has(m.kit("status").out, "Tools not installed here: probe")
+
+
+@test
+def fizsh_records_real_portable_recipe(sb):
+    m = setup(sb); sb.stub("brew", code=0); sb.stub("curl", code=1)
+    m.kit("add", "fizsh", "--mac", "brew:fizsh", code=None if PLAT == "linux" else 0)
+    ok(m.json("packages.json")["fizsh"]["linux"] == "builtin:fizsh")
+
+
+@test
+def fizsh_legacy_zsh_placeholder_is_migrated(sb):
+    m = setup(sb); sb.stub("curl", code=1)
+    m.repo_write("packages.json", json.dumps({"fizsh": {"mac": "brew:fizsh", "linux": "builtin:zsh"}}))
+    m.kit("packages", "resolve", "fizsh")
+    ok(m.json("packages.json")["fizsh"]["linux"] == "builtin:fizsh")
+
+
+@test
+def status_lists_saved_additions_changes_and_deletions(sb):
+    m = setup(sb, {".changed": "old\n", ".deleted": "old\n"}, add=[".changed", ".deleted"])
+    m.sync()
+    m.write(".changed", "new\n"); m.write(".added", "new\n")
+    (m.home / ".deleted").unlink()
+    m.kit("add", "~/.added"); m.kit("save")
+    r = m.kit("status")
+    pending = r.out.split("Saved, not backed up yet:", 1)[1]
+    has(pending, "changed          ~/.changed", "deleted          ~/.deleted", "added            ~/.added")
+    hasnt(r.out, "Files (this machine vs the repo):")
+    scoped = m.kit("status", "~/.changed").out
+    has(scoped, "Saved, not backed up yet:", "~/.changed")
+    hasnt(scoped, "~/.added", "~/.deleted", "in sync")
+    m.sync()
+    hasnt(m.kit("status").out, "Saved, not backed up yet:")
+
+
+@test
+def status_lists_package_recipe_changes_by_package_name(sb):
+    m = setup(sb); m.sync()
+    for name in ("existing", "added", "removed"): sb.stub(name, code=0)
+    old = {"existing": {PLAT: "cargo:existing@1"}, "removed": {PLAT: "cargo:removed"}}
+    m.repo_write("packages.json", json.dumps(old)); m.git("add", "-A"); m.git("commit", "-qm", "baseline")
+    new = {"existing": {PLAT: "cargo:existing@2"}, "added": {PLAT: "cargo:added"}}
+    m.repo_write("packages.json", json.dumps(new))
+    pending = m.kit("status").out.split("Saved, not backed up yet:", 1)[1]
+    has(pending, "updated          package existing", "added            package added", "removed          package removed", f"({PLAT})")
+    hasnt(pending, "changed          packages.json")
+
+
+@test
+def status_lists_staged_renames_and_untracked_repo_files(sb):
+    m = setup(sb, {'.old name': "old\n"}, add=['.old name']); m.sync()
+    name = '.new "é"'
+    m.git("mv", "home/.old name", "home/" + name)
+    m.repo_write("scripts/nested/new.sh", "echo test\n")
+    r = m.kit("status")
+    pending = r.out.split("Saved, not backed up yet:", 1)[1]
+    has(pending, "deleted          ~/.old name", "added            ~/" + name, "added            scripts/nested/new.sh")
+    hasnt(pending, "\\303")
+
+
+@test
+def status_distinguishes_committed_outgoing_and_incoming_files(sb):
+    a, b, _ = two_machines(sb, {".zshrc": "base\n"})
+    a.repo_write("home/.to-send", "local\n"); a.git("add", "-A"); a.git("commit", "-qm", "local")
+    b.write(".to-get", "remote\n"); b.kit("add", "~/.to-get"); b.sync()
+    a.git("fetch", "-q")
+    r = a.kit("status")
+    has(r.out, "1 commit(s) to send, 1 to get", "To send:", "To get (last fetched):")
+    outgoing, incoming = r.out.split("To send:", 1)[1].split("To get (last fetched):", 1)
+    has(outgoing, "~/.to-send"); hasnt(outgoing, "~/.to-get")
+    has(incoming, "~/.to-get"); hasnt(incoming, "~/.to-send")
+
+
+@test
+def sync_preserves_cargo_delta_and_never_generates_recipes(sb):
+    m = setup(sb)
+    m.write(".cargo/bin/delta", "#!/bin/sh\nexit 0\n"); (m.home/".cargo/bin/delta").chmod(0o755)
+    sb.unstub("delta"); sb.stub("brew", code=0)
+    m.repo_write("packages.json", json.dumps({"git-delta":{"mac":"cargo:git-delta", "linux":"cargo:git-delta@0.20.1"}, "legacy":{"mac":"cargo:legacy"}}))
+    before = pkgs(m)
+    r = m.kit("sync", code=None)
+    ok(pkgs(m) == before, "sync silently modified package recipes")
+    hasnt(r.both, "added Linux recipe", "installing delta", "installing git-delta")
+    ok(not any("brew install git-delta" in c for c in sb.calls("brew")), sb.calls())
+    names = [p["name"] for p in json.loads(m.kit("packages", "--json").out)]
+    ok("git-delta" in names and "delta" not in names, names)
+
+
+@test
+def packages_resolve_is_explicit_and_does_not_install(sb):
+    m = setup(sb); sb.stub("mise", script=MISE_STUB)
+    m.repo_write("packages.json", json.dumps({"portable":{"mac":"cargo:portable"}}))
+    m.git("add", "-A"); m.git("commit", "-qm", "legacy recipe")
+    m.kit("packages", "resolve", "portable")
+    ok(pkgs(m)["portable"]["linux"] == "cargo:portable@1.2.3")
+    ok(not sb.calls("cargo"), sb.calls())
+    has(m.kit("status").out, "updated          package portable (linux)")
+
+
+@test
+def packages_resolve_kitty_and_report_unresolved_casks(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"kitty":{"mac":"cask:kitty", "remote":False},
+                                               "unknown":{"mac":"cask:unknown"},
+                                               "empty":{},
+                                               "custom":{"mac":"cask:kitty", "linux":"github:custom/kitty@1"}}))
+    r = m.kit("packages", "resolve", "kitty", "unknown", "empty", "custom", code=1)
+    has(r.both, "kitty: added Linux recipe", "unknown: could not resolve", "empty: cannot resolve", "custom: Linux recipe already set")
+    p = pkgs(m)
+    ok(p["kitty"] == {"mac":"cask:kitty", "linux":"system:kitty", "remote":False}, p)
+    ok(p["custom"]["linux"] == "github:custom/kitty@1")
+    ok("linux" not in p["unknown"])
+    ok(not sb.calls("cargo") and not sb.calls("brew"), sb.calls())
+    has(m.kit("packages", "resolve", "kitty").both, "Linux recipe already set")
+
+
+@test
+def packages_tui_kitty_recipe_persists_on_reopen(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"kitty":{"mac":"cask:kitty"}}))
+    package_dialogue(m, b"/kitty\rlq")
+    ok("linux" not in pkgs(m)["kitty"], "queued resolution applied without Enter")
+    has(package_dialogue(m, b"/kitty\rl\r"), "kitty: added Linux recipe")
+    ok(pkgs(m)["kitty"]["linux"] == "system:kitty")
+    raw = package_dialogue(m, b"/kitty\rq")
+    has(raw, "system:kitty")
+
+
+@test
+def packages_inventory_scope_and_remove(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"probe":{PLAT:"cargo:probe", "linux":"cargo:probe"}}))
+    sb.stub("probe", code=0)
+    r = m.kit("packages", "list")
+    has(r.out, "probe  [tracked]  installed", "servers: yes", "kit built-in")
+    m.kit("pkg", "local", "probe"); ok(pkgs(m)["probe"]["remote"] is False)
+    m.kit("packages", "servers", "probe"); ok("remote" not in pkgs(m)["probe"])
+    m.kit("packages", "remove", "probe"); ok("probe" not in pkgs(m))
+    ok((sb.fakebin/"probe").exists(), "remove uninstalled the tool")
+    ok(not any("uninstall" in c for c in sb.calls()), sb.calls())
+    m.kit("packages", "remove", "bat", code=1)
+    m.kit("packages", "--tui", code=1)
+
+
+@test
+def packages_update_explicitly_upgrades_installed_brew_tool(sb):
+    if PLAT != "mac": return
+    m = setup(sb); sb.stub("probe", code=0)
+    sb.stub("brew", script="case \"$1\" in outdated) echo '{\"formulae\":[{\"name\":\"probe\"}],\"casks\":[]}' ;; esac\nexit 0\n")
+    (sb.root/"Cellar/probe").mkdir()
+    m.repo_write("packages.json", json.dumps({"probe":{"mac":"brew:probe", "linux":"aqua:o/probe@1"}}))
+    m.kit("packages", "update", "probe")
+    ok("brew upgrade --formula probe" in sb.calls("brew"), sb.calls())
+
+
+def package_dialogue(m, keys):
+    import pty, select, termios, fcntl, struct
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 26, 100, 0, 0))
+    saved = termios.tcgetattr(slave)
+    proc = subprocess.Popen(KIT + ["packages", "--tui"], cwd=m.home, env=m.envvars,
+                            stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+    buf = b""; sent = False; deadline = time.monotonic() + 10
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try: chunk = os.read(master, 65536)
+                except OSError: break
+                buf += chunk
+            if not sent and b"KIT" in buf and b"Packages" in buf:
+                os.write(master, keys); sent = True
+            if proc.poll() is not None: break
+        ok(proc.poll() is not None, "package UI hung: " + buf.decode(errors="replace"))
+        ok(proc.returncode == 0, buf.decode(errors="replace"))
+        restored = termios.tcgetattr(slave)
+        # macOS sets PENDIN when canonical input is restored; this is kernel queue state.
+        restored[3] &= ~getattr(termios, "PENDIN", 0)
+        saved[3] &= ~getattr(termios, "PENDIN", 0)
+        ok(restored == saved, "package UI did not restore terminal settings")
+        return buf.decode(errors="replace")
+    finally:
+        if proc.poll() is None: proc.kill(); proc.wait()
+        os.close(master); os.close(slave)
+
+
+@test
+def packages_tui_stages_cancels_applies_and_restores_terminal(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"alpha":{"mac":"cargo:alpha", "linux":"cargo:alpha"}, "beta":{"mac":"cargo:beta", "linux":"cargo:beta"}}))
+    before = pkgs(m)
+    has(package_dialogue(m, b"/alpha\rdq"), "manifest unchanged")
+    ok(pkgs(m) == before, "cancel applied staged changes")
+    package_dialogue(m, b"/alpha\rs\r")
+    ok(pkgs(m)["alpha"]["remote"] is False)
+    package_dialogue(m, b"/alpha\rd\r")
+    ok("alpha" not in pkgs(m) and "beta" in pkgs(m))
+    package_dialogue(m, b"\x03")
+    m.kit("packages", "remove", "beta", "missing", code=1)
+    ok("beta" in pkgs(m), "invalid batch partially removed valid entries")
+
+
+@test
+def packages_tui_combines_actions_and_reverses_scope(sb):
+    m = setup(sb)
+    sb.stub("mise", script=MISE_STUB)
+    m.repo_write("packages.json", json.dumps({"alpha":{"mac":"cargo:alpha", "remote":False}}))
+    package_dialogue(m, b"/alpha\rsl\r")
+    p = pkgs(m)["alpha"]
+    ok("remote" not in p, "resolving overwrote the SSH toggle")
+    ok(p["linux"].startswith("cargo:alpha"), p)
+    before = pkgs(m)
+    package_dialogue(m, b"/alpha\rss\r")
+    ok(pkgs(m) == before, "toggling twice did not undo the pending change")
+
+
+@test
+def packages_tui_runs_update_before_removing_same_entry(sb):
+    m = setup(sb)
+    installed_cargo_fixture(m, crate="probe", binary="probe")
+    m.repo_write("packages.json", json.dumps({"probe":{"mac":"cargo:probe", "linux":"cargo:probe@1.0.0"}}))
+    sb.stub("cargo", script="""case "$1" in search) echo 'probe = "1.0.0" # test';; install) exit 99;; esac\nexit 0\n""")
+    package_dialogue(m, b"/probe\rud\r")
+    ok("probe" not in pkgs(m), "removal was overwritten")
+    ok(any(" search " in call for call in sb.calls("cargo")), "removal discarded the update action")
+
+
+@test
+def package_updates_preserve_nonversioned_recipe_kinds(sb):
+    if PLAT != "mac": return
+    m = setup(sb); sb.stub("probe", code=0); sb.stub("cargo", code=0)
+    for linux in ("system:probe", "builtin:fizsh", "cmd:echo probe"):
+        m.repo_write("packages.json", json.dumps({"probe":{"mac":"cargo:probe", "linux":linux}}))
+        m.kit("packages", "update", "probe")
+        ok(pkgs(m)["probe"]["linux"] == linux, pkgs(m))
+
+
+@test
+def packages_tui_arrow_keys_and_incremental_rendering(sb):
+    m = setup(sb)
+    baseline = {"probe-a":{"mac":"cargo:probe-a", "linux":"cargo:probe-a"},
+                "probe-b":{"mac":"cargo:probe-b", "linux":"cargo:probe-b"}}
+    # CSI is normal cursor mode; SS3 is application cursor mode (common in SSH/kitty).
+    for down, up in ((b"\x1b[B", b"\x1b[A"), (b"\x1bOB", b"\x1bOA")):
+        m.repo_write("packages.json", json.dumps(baseline))
+        raw = package_dialogue(m, b"/probe\r" + down + b"s\r")
+        ok(pkgs(m)["probe-b"]["remote"] is False, "Down did not select the next package")
+        ok("remote" not in pkgs(m)["probe-a"])
+        ok(raw.count("\x1b[2J") <= 1, "keypresses caused full-screen clears")
+        m.repo_write("packages.json", json.dumps(baseline))
+        package_dialogue(m, b"/probe\r" + down + up + b"s\r")
+        ok(pkgs(m)["probe-a"]["remote"] is False, "Up did not select the previous package")
+        ok("remote" not in pkgs(m)["probe-b"])
+
+
+def installed_cargo_fixture(m, crate="git-delta", binary="delta", version="1.0.0", root=".cargo", source="registry+https://github.com/rust-lang/crates.io-index"):
+    m.write(f"{root}/bin/{binary}", "#!/bin/sh\nexit 0\n")
+    (m.home/root/"bin"/binary).chmod(0o755)
+    m.write(f"{root}/.crates2.json", json.dumps({"installs": {f"{crate} {version} ({source})": {"bins":[binary]}}}))
+
+
+@test
+def update_keeps_cargo_provider_with_stale_brew_recipe_and_duplicate_entries(sb):
+    m = setup(sb); installed_cargo_fixture(m)
+    # Both providers are present. Cargo's ownership record must win over the stale recipe.
+    sb.stub("delta", code=0); sb.stub("brew", code=0)
+    m.repo_write("packages.json", json.dumps({"delta":{"mac":"brew:git-delta", "linux":"cargo:git-delta@1.0.0"},
+                                               "git-delta":{"mac":"cargo:git-delta", "linux":"cargo:git-delta@1.0.0"}}))
+    sb.stub("cargo", script="""case "$1" in search) echo 'git-delta = "1.0.0" # test';; install) exit 99;; esac\nexit 0\n""")
+    r = m.kit("packages", "update", "delta", "git-delta")
+    has(r.out, "up to date", "checked once")
+    calls = sb.calls("cargo")
+    ok(sum(" search " in c for c in calls) == 1, calls)
+    ok(not any(" install " in c or "--force" in c for c in calls), calls)
+    ok(not sb.calls("brew"), sb.calls())
+    ok(pkgs(m)["delta"][PLAT] == "cargo:git-delta@1.0.0", pkgs(m))
+    ok(pkgs(m)["git-delta"][PLAT] == "cargo:git-delta@1.0.0", pkgs(m))
+
+
+@test
+def update_installs_only_newer_selected_cargo_package_and_check_is_read_only(sb):
+    m = setup(sb); installed_cargo_fixture(m, "probe", "probe")
+    m.repo_write("packages.json", json.dumps({"probe": {PLAT:"cargo:probe@1.0.0"}, "other":{PLAT:"cargo:other"}}))
+    sb.stub("cargo", script="""case "$1" in search) echo 'probe = "2.0.0" # test';; esac\nexit 0\n""")
+    before = pkgs(m)
+    r = m.kit("packages", "update", "--check", "probe")
+    has(r.out, "update available", "check only")
+    ok(pkgs(m) == before)
+    ok(not any(" install " in c for c in sb.calls("cargo")), sb.calls())
+    r = m.kit("packages", "update", "probe")
+    has(r.out, "1.0.0 → 2.0.0")
+    ok(sb.calls("cargo").count("cargo install --locked probe@2.0.0") == 1, sb.calls())
+    ok(not any("--force" in c or "install other" in c for c in sb.calls()), sb.calls())
+    hasnt(r.out, "setting up tools", "installing other")
+    ok(pkgs(m)["probe"][PLAT] == "cargo:probe@2.0.0")
+
+
+@test
+def update_never_installs_when_cargo_lookup_fails_or_would_downgrade(sb):
+    m = setup(sb); installed_cargo_fixture(m, "probe", "probe", "2.0.0")
+    m.repo_write("packages.json", json.dumps({"probe": {PLAT:"cargo:probe@2.0.0"}}))
+    before = pkgs(m)
+    sb.stub("cargo", script="""case "$1" in search) echo 'probe = "1.0.0" # test';; esac\nexit 0\n""")
+    has(m.kit("packages", "update", "probe").out, "up to date")
+    sb.stub("cargo", script="exit 1\n")
+    m.kit("packages", "update", "probe", code=1)
+    ok(pkgs(m) == before)
+    ok(not any(" install " in c for c in sb.calls("cargo")), sb.calls())
+
+
+@test
+def update_brew_checks_outdated_and_skips_current_or_missing_packages(sb):
+    if PLAT != "mac": return
+    m = setup(sb); sb.stub("probe", code=0)
+    (sb.root/"Cellar/probe").mkdir()
+    m.repo_write("packages.json", json.dumps({"probe":{"mac":"brew:probe"}, "missing":{"mac":"brew:missing"}}))
+    sb.stub("brew", script="""case "$1" in outdated) echo '{"formulae":[],"casks":[]}';; esac\nexit 0\n""")
+    has(m.kit("packages", "update", "probe", "missing").out, "up to date")
+    ok(not any("install" in c or " upgrade " in c for c in sb.calls("brew")), sb.calls())
+
+
+@test
+def add_existing_cargo_binary_records_its_actual_provider(sb):
+    m = setup(sb); installed_cargo_fixture(m, "probe", "probe")
+    sb.stub("brew", code=0); sb.stub("mise", script=MISE_STUB)
+    m.kit("add", "probe", code=None if PLAT == "linux" else 0)
+    ok(pkgs(m)["probe"][PLAT] == "cargo:probe@1.0.0", pkgs(m))
+
+
+@test
+def update_uses_custom_cargo_home_without_forcing_install(sb):
+    m = setup(sb); installed_cargo_fixture(m, "probe", "probe", root="custom-cargo")
+    m.repo_write("packages.json", json.dumps({"probe":{PLAT:"cargo:probe"}}))
+    sb.stub("cargo", script="""case "$1" in search) echo 'probe = "1.0.0" # test';; esac\nexit 0\n""")
+    m.kit("packages", "update", "probe", env={"CARGO_HOME":str(m.home/"custom-cargo")})
+    ok(not any(" install " in c for c in sb.calls("cargo")), sb.calls())
+
+
+@test
+def update_mise_checks_version_and_never_reconciles_unselected_tools(sb):
+    m = setup(sb)
+    m.write(".local/kit/mise/shims/probe", "#!/bin/sh\nexit 0\n")
+    (m.home/".local/kit/mise/shims/probe").chmod(0o755)
+    recipe = "mise:aqua:o/probe@1.0.0" if PLAT == "mac" else "aqua:o/probe@1.0.0"
+    m.repo_write("packages.json", json.dumps({"probe":{PLAT:recipe}, "other":{PLAT:"cmd:touch should-not-run"}}))
+    script = """case "$1" in
+ls) echo '{"probe":[{"version":"1.0.0","active":true,"installed":true}]}' ;;
+latest) echo 1.0.0 ;;
+esac
+exit 0
+"""
+    sb.stub("mise", script=script)
+    has(m.kit("packages", "update", "probe").out, "up to date")
+    ok(not any("use " in c or "install " in c for c in sb.calls("mise")), sb.calls())
+    sb.stub("mise", script=script.replace("latest) echo 1.0.0", "latest) echo 2.0.0"))
+    r = m.kit("packages", "update", "probe")
+    hasnt(r.out, "setting up tools", "other")
+    ok("mise use --global aqua:o/probe@2.0.0" in sb.calls("mise"), sb.calls())
+    ok(not m.exists("should-not-run"))
+
+
+@test
+def update_cargo_git_checks_commit_before_running_installer(sb):
+    m = setup(sb)
+    upstream = sb.make_git_repo("cargo-upstream", {"README":"old\n"})
+    revision = sb.git_raw(["rev-parse", "HEAD"], cwd=upstream).stdout.strip()
+    url = upstream.as_uri()
+    installed_cargo_fixture(m, "probe", "probe", source=f"git+{url}#{revision}")
+    recipe = ("cargo-git:" if PLAT == "mac" else "cargo:") + url
+    m.repo_write("packages.json", json.dumps({"probe":{PLAT:recipe}}))
+    sb.stub("cargo", code=0)
+    has(m.kit("packages", "update", "probe").out, "up to date (Cargo Git)")
+    ok(not sb.calls("cargo"), sb.calls())
+    (upstream/"README").write_text("new\n")
+    sb.git_raw(["add", "-A"], cwd=upstream); sb.git_raw(["commit", "-qm", "new source"], cwd=upstream)
+    has(m.kit("packages", "update", "probe").out, "newer Cargo Git revision")
+    ok(sb.calls("cargo") == [f"cargo install --locked --git {url} probe"], sb.calls())
+
+
 # =========================================================================== runner
 def run_one(fn):
     sb = Sandbox(fn.__name__)
@@ -2232,7 +2915,7 @@ def run_one(fn):
         msg = f"{type(e).__name__ if not isinstance(e, Fail) else ''}{': ' if not isinstance(e, Fail) else ''}{e}"
         detail = f"  at {where}: {msg}\n"
         if not isinstance(e, Fail):
-            detail += "".join(traceback.format_exception(e)).rstrip() + "\n"
+            detail += "".join(traceback.format_exception(type(e), e, e.__traceback__)).rstrip() + "\n"
         for res in sb.history[-3:]:
             detail += _indent(res.show()) + "\n"
         detail += f"  sandbox kept at {sb.root}\n"
