@@ -49,7 +49,11 @@ def terminal(commands):
                 sent = True
             if proc.poll() is not None: break
         out = output.decode(errors='replace')
-        assert proc.poll() is not None, 'shell did not exit: ' + out
+        # PTY EOF can arrive just before the process exit status is available.
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            raise AssertionError('shell did not exit: ' + out)
         assert proc.returncode == 0, out
         return out
     finally:
@@ -58,10 +62,14 @@ def terminal(commands):
 
 try:
     run('bash', str(ASSETS / 'install-fizsh.sh'))
+    insecure = root / 'insecure-completions'; insecure.mkdir(); insecure.chmod(0o777)
+    (insecure / '_kit_insecure').write_text('#compdef kit-insecure\n_arguments "*::arg:()"\n')
+    (home / '.zshenv').write_text(f'fpath=({str(insecure)!r} $fpath)\nexport FPATH\n')
     shell = str(kit / 'bin/kit-shell')
     assert 'fizsh, version 1.0.9' in run(shell, '--version')
-    out = terminal("printf '\\nFIZSH_PROBE=%s:%s\\n' \"$_fizsh_F_CENTRAL_VERSION\" \"${+functions[_zsh_highlight]}\"")
-    assert 'FIZSH_PROBE=1.0.9:1' in out, out
+    out = terminal("printf '\\nFIZSH_PROBE=%s:%s:%s\\n' \"$_fizsh_F_CENTRAL_VERSION\" \"${+functions[_zsh_highlight]}\" \"${_comps[kit-insecure]-missing}\"")
+    assert 'FIZSH_PROBE=1.0.9:1:missing' in out, out
+    assert 'Ignore insecure directories' not in out, out
     assert (home / '.fizsh/zsh-history-substring-search.zsh').is_file()
     # Upstream normally deletes .zshrc on version change. Kit must preserve it and user plugins.
     rc = home / '.fizsh/.zshrc'

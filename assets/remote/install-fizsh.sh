@@ -18,6 +18,8 @@ src="$tmp/fizsh-$revision"
 mkdir -p "$tmp/installed/bin" "$tmp/installed/etc/fizsh"
 cp "$src/COPYING" "$tmp/installed/COPYING"
 cp "$src/scripts/"*.zsh "$tmp/installed/etc/fizsh/"
+# Ignore insecure completion directories instead of accepting them (-u upstream).
+sed 's/compinit -u/compinit -i/' "$src/scripts/fizshrc.zsh" > "$tmp/installed/etc/fizsh/fizshrc.zsh"
 # Upstream resets ~/.fizsh/.zshrc on first launch/version change and refreshes user files.
 # Kit owns reconciliation: initialize missing files, never delete or replace existing config.
 awk '
