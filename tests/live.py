@@ -45,6 +45,9 @@ def main():
         source = home/'.local/share/kit'
         (source/'packages.json').write_text(json.dumps(pkgs))
         run(kit, 'packages', 'resolve')
+        # Later failure/retry fixtures must retain the explicitly resolved recipes.
+        # Sync deliberately does not regenerate a recipe removed from the manifest.
+        pkgs = json.loads((source/'packages.json').read_text())
         run(kit, 'sync')
         tools = ['rg', 'jq', 'prettier', 'node', 'nvim', 'bat', 'delta', 'gtimeout'] + (['just'] if args.source else [])
         checks = '; '.join(f'{tool} --version >/dev/null || exit 1' for tool in tools)
