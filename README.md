@@ -11,7 +11,7 @@ server over ssh.
 ## Install
 
 ```bash
-cargo install dotkit        # the command is `kit`
+cargo install dotkit --locked # the command is `kit`
 ```
 
 No Rust? On macOS or Linux:
@@ -254,7 +254,7 @@ python3 tests/live.py --kit target/debug/kit --source   # also builds a Cargo to
 
 The live test never uses your real dotfile repo. It checks cold installation, executable
 versions, shell config, idempotence, partial failures and recovery by retry. CI runs this
-on Ubuntu, the sandbox suites on macOS/Linux, and checks the minimum Rust version (1.85).
+on Ubuntu, the sandbox suites on macOS/Linux, and checks the minimum Rust version (1.88).
 
 Backend details: [mise registry](https://mise.jdx.dev/registry.html),
 [Cargo runtime requirements](https://mise.jdx.dev/dev-tools/backends/cargo.html), and
