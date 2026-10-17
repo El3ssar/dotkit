@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "dotkit"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",

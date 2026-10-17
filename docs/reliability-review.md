@@ -1,7 +1,6 @@
 # Reliability review — 2026-10-17
 
-The development build is `0.3.0-dev`. These changes are not published to crates.io
-or GitHub releases. Existing dotfile repositories are not automatically migrated.
+This review covers `0.3.0`. Existing dotfile repositories are not automatically migrated.
 
 ## Package contract
 
