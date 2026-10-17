@@ -2699,7 +2699,8 @@ def gcloud_uses_the_checksum_pinned_owned_recipe_without_plugins(sb):
     sb.unstub("gcloud")
     owned=m.write(".local/kit/bin/gcloud","#!/bin/sh\nexit 0\n");owned.chmod(0o755)
     m.write(".local/kit/opt/gcloud/kit-version","589.0.0\n")
-    m.kit("add", "gcloud-cli")
+    # CI images can include /usr/bin/gcloud; select the owned installation explicitly.
+    m.kit("add", "gcloud-cli", env={"PATH":str(owned.parent)+os.pathsep+m.envvars["PATH"]})
     entry=pkgs(m)["gcloud-cli"]
     ok(entry["linux"] == "builtin:gcloud@589.0.0" and entry["mac"] == "builtin:gcloud@589.0.0", entry)
     sb.stub("gcloud",code=0)
