@@ -180,6 +180,161 @@ pub fn run<S: AsRef<OsStr>>(cmd: &[S], capture: bool) -> Out {
     run_full(cmd, capture, None, None, None)
 }
 
+/// Provider lookups have a bounded lifetime and cannot ask questions on stdin.
+/// Their process group is owned by this call, so a timeout also stops children.
+pub fn query<S: AsRef<OsStr>>(cmd: &[S], seconds: u64) -> Out {
+    query_full(cmd, seconds, None, None)
+}
+
+pub fn query_full<S: AsRef<OsStr>>(
+    cmd: &[S],
+    seconds: u64,
+    cwd: Option<&Path>,
+    env: Option<&[(String, String)]>,
+) -> Out {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let program = cmd[0].as_ref();
+    let resolved = program.to_str().and_then(which);
+    let mut command = Command::new(resolved.as_deref().map(Path::as_os_str).unwrap_or(program));
+    command
+        .args(&cmd[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    command
+        .env("MISE_HTTP_TIMEOUT", "20s")
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    if let Some(vars) = env {
+        command.envs(vars.iter().map(|(k, v)| (k, v)));
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Out {
+                code: 127,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            }
+        }
+    };
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let reader = |pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.take(8 * 1024 * 1024).read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let out = reader(Box::new(stdout));
+    let err = reader(Box::new(stderr));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                // SAFETY: the child created a new process group whose id is its pid.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                break 124;
+            }
+        }
+    };
+    // A query may exit while a background child still holds its output pipe.
+    // Close the owned group before joining the readers; never wait indefinitely.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
+    let mut stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
+    if code == 124 {
+        stderr.push_str(&format!("provider lookup timed out after {seconds}s"));
+    }
+    if stdout.len() >= 8 * 1024 * 1024 || stderr.len() >= 8 * 1024 * 1024 {
+        code = 1;
+        stderr.push_str("provider response exceeds the 8 MiB limit");
+    }
+    Out {
+        code,
+        stdout,
+        stderr,
+    }
+}
+
+/// Installs are noninteractive, logged, and bounded. Ordinary read-only queries
+/// keep using run_full so checking status does not write install state.
+pub fn run_install<S: AsRef<OsStr>>(
+    name: &str,
+    cmd: &[S],
+    cwd: Option<&Path>,
+    env: Option<&[(String, String)]>,
+) -> Out {
+    let state = &ctx().state;
+    let script = state.join("run-install.sh");
+    if let Err(e) = write_atomic(
+        &script,
+        include_bytes!("../assets/remote/run-install.sh"),
+        0o700,
+    ) {
+        return Out {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("cannot prepare install runner: {e}"),
+        };
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let log = state.join(format!("install-{safe}.log"));
+    note(&format!("install log: {}", log.display()));
+    let limit = env
+        .and_then(|vars| {
+            vars.iter()
+                .find(|(k, _)| k == "KIT_INSTALL_TIMEOUT")
+                .map(|(_, v)| v.clone())
+        })
+        .or_else(|| std::env::var("KIT_INSTALL_TIMEOUT").ok())
+        .unwrap_or_else(|| "1800".into());
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "bash".into(),
+        script.into_os_string(),
+        log.into_os_string(),
+        limit.into(),
+    ];
+    // The wrapper executes its argv directly. Match run_full/query_full's
+    // executable lookup, including a freshly bootstrapped private mise or a
+    // Cargo installation that is not yet on this shell's PATH.
+    let program = cmd[0].as_ref();
+    let resolved = program.to_str().and_then(which);
+    args.push(
+        resolved
+            .as_deref()
+            .map(Path::as_os_str)
+            .unwrap_or(program)
+            .to_os_string(),
+    );
+    args.extend(cmd[1..].iter().map(|s| s.as_ref().to_os_string()));
+    run_full(&args, false, cwd, env, None)
+}
+
 pub fn run_full<S: AsRef<OsStr>>(
     cmd: &[S],
     capture: bool,
@@ -644,4 +799,21 @@ pub fn hostname() -> String {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    #[test]
+    fn provider_queries_timeout_and_stop_children_holding_pipes() {
+        let start = std::time::Instant::now();
+        let r = query(&["sh", "-c", "sleep 10"], 1);
+        assert_eq!(r.code, 124);
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        let start = std::time::Instant::now();
+        let r = query(&["sh", "-c", "sleep 10 & printf done"], 2);
+        assert_eq!(r.code, 0);
+        assert_eq!(r.stdout, "done");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
 }

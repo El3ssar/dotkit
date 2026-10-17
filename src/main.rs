@@ -14,15 +14,20 @@
 //!
 //! Per-machine state (what was last synced, backups, script runs) lives in
 //! ~/.local/state/kit, never in the repo.
+mod capability;
 mod cli;
 mod complete;
 mod core;
 mod diff;
+mod file_manager;
 mod files;
+mod inspect;
 mod packages;
 mod pkg;
+mod recipe;
 mod remote;
 mod scripts;
+mod tui;
 mod updates;
 mod util;
 
@@ -107,6 +112,20 @@ fn usage_error(e: clap::Error, argv: &[String]) -> ! {
     }
 }
 
+fn validate_inventory_mode(m: &clap::ArgMatches) {
+    let Some((name, sub)) = m.subcommand() else {
+        return;
+    };
+    let a = Args::new(sub.clone());
+    if matches!(name, "packages" | "files") {
+        if let Some((action, _)) = a.subcommand() {
+            if (a.flag("json") && action != "list") || a.flag("tui") {
+                die_code("inventory modes apply only to the inventory; use kit packages --json or kit packages list --json", 2);
+            }
+        }
+    }
+}
+
 fn dispatch(m: &clap::ArgMatches) {
     let Some((name, sub)) = m.subcommand() else {
         let _ = build_cli().print_help();
@@ -117,10 +136,13 @@ fn dispatch(m: &clap::ArgMatches) {
         "init" => files::cmd_init(&a),
         "add" => files::cmd_add(&a),
         "packages" => packages::command(&a),
+        "files" => file_manager::command(&a),
         "rm" => files::cmd_rm(&a),
         "status" => files::cmd_status(&a),
         "save" => files::cmd_save(&a),
+        "sync" if a.flag("dry_run") => inspect::plan(&a),
         "sync" => files::cmd_sync(&a),
+        "doctor" => inspect::doctor(&a),
         "undo" => files::cmd_undo(&a),
         "push" => remote::cmd_push(&a),
         "completion" => complete::cmd_completion(&a),
@@ -157,15 +179,25 @@ fn main() {
     let m = build_cli()
         .try_get_matches_from(std::iter::once("kit".to_string()).chain(argv.iter().cloned()))
         .unwrap_or_else(|e| usage_error(e, &argv));
+    validate_inventory_mode(&m);
     let cmd = m.subcommand_name().unwrap_or("");
-    let _locks = (!cmd.is_empty()).then(lock_workspace);
-    if !cmd.is_empty() && cmd != "init" && cmd != "completion" && !ctx().source.exists() {
+    let inspection = cmd == "doctor"
+        || (cmd == "sync"
+            && m.subcommand()
+                .is_some_and(|(_, a)| Args::new(a.clone()).flag("dry_run")));
+    let _locks = (!cmd.is_empty() && !inspection).then(lock_workspace);
+    if !cmd.is_empty()
+        && cmd != "init"
+        && cmd != "completion"
+        && cmd != "doctor"
+        && !ctx().source.exists()
+    {
         die(&format!(
             "no kit repo at {} — run `kit init` (or `kit init <git-url>`)",
             tilde(&ctx().source)
         ));
     }
-    if !cmd.is_empty() {
+    if !cmd.is_empty() && !inspection {
         files::migrate_state();
         complete::ensure_completions();
     }

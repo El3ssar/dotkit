@@ -12,7 +12,11 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 if [ -f "$HOME/.fizsh/.zshrc" ]; then export ZDOTDIR="$HOME/.fizsh"
 else export ZDOTDIR="$HOME"; fi
 if [ "$(uname -s)" = Darwin ]; then
-  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  # Fill missing standard locations without overriding the caller's selected
+  # provider (or the PATH stubs used by isolated provisioning tests).
+  case ":$PATH:" in *:/opt/homebrew/bin:*) ;; *) PATH="$PATH:/opt/homebrew/bin" ;; esac
+  case ":$PATH:" in *:/usr/local/bin:*) ;; *) PATH="$PATH:/usr/local/bin" ;; esac
+  export PATH
 fi
 export ZELLIJ_CONFIG_DIR="$XDG_CONFIG_HOME/zellij"
 export EDITOR=nvim
@@ -22,14 +26,24 @@ export SHELL="$KIT/bin/fizsh"
 export MISE_DATA_DIR="$KIT/mise" MISE_CACHE_DIR="$KIT/cache/mise" MISE_STATE_DIR="$KIT/state/mise"
 export MISE_GLOBAL_CONFIG_FILE="$KIT/mise.toml" MISE_CONFIG_DIR="$KIT/config/mise"
 export MISE_TRUSTED_CONFIG_PATHS="$KIT" MISE_YES=1
-# Rust (only installed when a tool has to be built from source) also stays inside the kit;
-# no cargo-binstall: it would fetch the same prebuilt binary that didn't run here
-export RUSTUP_HOME="$KIT/rustup" CARGO_HOME="$KIT/cargo" MISE_CARGO_BINSTALL=false
+# Preserve an existing Rust installation and explicit user overrides. Only use
+# Kit's private toolchain when no ordinary toolchain is present. Provisioning
+# sets its private build roots separately from the user's shell environment.
+if [ -z "${RUSTUP_HOME:-}" ] && [ ! -d "$HOME/.rustup/toolchains" ] && [ -d "$KIT/rustup/toolchains" ]; then
+  export RUSTUP_HOME="$KIT/rustup"
+fi
+if [ -z "${CARGO_HOME:-}" ] && [ ! -d "$HOME/.cargo" ] && [ -d "$KIT/cargo" ]; then
+  export CARGO_HOME="$KIT/cargo"
+fi
+export MISE_CARGO_BINSTALL=false
 
-case ":$PATH:" in
-  *":$KIT/bin:"*) ;;
-  *) export PATH="$KIT/bin:$KIT/cargo/bin:$KIT/opt/zsh/bin:$KIT/mise/shims:$KIT/opt/nvim/bin:$HOME/.local/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH" ;;
-esac
+# Check every entry independently: a pre-existing Kit bin directory does not
+# imply that tool shims (or an existing Cargo installation) are already on PATH.
+for kit_path in "$HOME/.cargo/bin" "$HOME/.elan/bin" "$HOME/.local/bin" "$KIT/opt/nvim/bin" "$KIT/mise/shims" "$KIT/opt/zsh/bin" "$KIT/cargo/bin" "$KIT/bin"; do
+  case ":$PATH:" in *":$kit_path:"*) ;; *) PATH="$kit_path:$PATH" ;; esac
+done
+unset kit_path
+export PATH
 
 # kitty's terminfo and shell integration travel with the kit
 # (trailing ':' keeps the system terminfo database too)

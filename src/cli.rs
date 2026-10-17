@@ -90,14 +90,14 @@ pub fn build_cli() -> Command {
         .subcommand(
             cmd(
                 "add",
-                "track files, folders or tools (a tool is installed here and on every machine)",
-                "kit add ~/.config/nvim ~/.gitconfig · kit add lazygit · kit add BurntSushi/ripgrep · kit add cask:kitty",
+                "track files, folders or tools with explicit platform recipes",
+                "kit add ~/.config/nvim ~/.gitconfig · kit add lazygit · kit add BurntSushi/ripgrep · kit add cargo:eza@0.23.0",
             )
             .arg(things(true, "FILE|TOOL"))
             .arg(flag("force", "even if it's ignored or looks like a secret"))
             .arg(flag("upgrade", "check and update this tracked tool through its installed provider").conflicts_with_all(["mac", "linux", "fallback", "bin", "force", "no_servers"]))
             .arg(flag("no_servers", "keep it off servers (kit push)"))
-            .arg(spec("mac", "how to install it on a Mac: brew:…, cask:…, cargo:…, cmd:<shell>"))
+            .arg(spec("mac", "how to install it on a Mac: a pinned mise/Cargo recipe or brew:<formula> / cask:<app>"))
             .arg(spec("linux", "how to install it on Linux and servers: a mise spec, e.g. aqua:owner/repo"))
             .arg(spec("fallback", "build it from source where no download runs, e.g. cargo:<crate>"))
             .arg(Arg::new("bin").long("bin").value_name("NAME").help("its command name, if different").help_heading("For tools")),
@@ -105,14 +105,21 @@ pub fn build_cli() -> Command {
         .subcommand(
             cmd("packages", "browse and manage the tools tracked for sync", "kit packages · kit packages list · kit packages update eza · kit packages resolve")
                 .visible_alias("pkg")
-                .arg(flag("json", "print the full package manifest, including kit's built-in tools"))
+                .arg(flag("json", "print the full package manifest, including kit's built-in tools").conflicts_with("tui"))
                 .arg(flag("tui", "open the interactive package manager (requires a terminal)"))
-                .subcommand(Command::new("list").about("list packages, recipes, installation state and server scope"))
+                .subcommand(Command::new("list").about("list packages, recipes, installation state and server scope").arg(flag("json", "print the inventory as JSON")))
+                .subcommand(Command::new("check").about("check provider artifacts for macOS/Linux x86_64/ARM64; source builds are reported separately").arg(Arg::new("names").num_args(0..)))
                 .subcommand(Command::new("update").about("check selected installed tools and update only when newer versions exist").arg(flag("check", "check versions without installing or changing recipes")).arg(Arg::new("names").num_args(1..).required(true)))
                 .subcommand(Command::new("remove").about("stop syncing selected tools; leave installed programs untouched").arg(Arg::new("names").num_args(1..).required(true)))
-                .subcommand(Command::new("resolve").about("generate missing Linux recipes for review; does not install tools").arg(Arg::new("names").num_args(0..)))
+                .subcommand(Command::new("resolve").about("resolve missing/unsupported Linux recipes via mise; does not install tools").arg(flag("both", "also resolve missing/unsupported macOS recipes")).arg(Arg::new("names").num_args(0..)))
                 .subcommand(Command::new("servers").about("include selected tools in kit push").arg(Arg::new("names").num_args(1..).required(true)))
                 .subcommand(Command::new("local").about("exclude selected tools from kit push").arg(Arg::new("names").num_args(1..).required(true)))
+        )
+        .subcommand(
+            cmd("files", "browse tracked files, compare versions and stage changes", "kit files · kit files list · kit files --json")
+                .arg(flag("json", "print tracked file state and SSH deployment scope").conflicts_with("tui"))
+                .arg(flag("tui", "open the interactive file manager"))
+                .subcommand(Command::new("list").about("list tracked files and changes").arg(flag("json", "print tracked file state as JSON")))
         )
         .subcommand(
             cmd("rm", "stop tracking files, folders or tools (nothing is deleted)", "kit rm ~/.config/foo · kit rm lazygit")
@@ -133,7 +140,9 @@ pub fn build_cli() -> Command {
             "sync",
             "back up what you saved, get what other machines saved (merging both)",
             "kit sync · kit sync --trust",
-        ).arg(flag("trust", "approve pending scripts, external checkouts and command recipes from this repo")))
+        ).arg(flag("trust", "approve pending scripts and external checkouts from this repo").conflicts_with("dry_run"))
+          .arg(flag("dry_run", "preview local sync actions without commits, network requests, installs or writes"))
+          .arg(flag("json", "print the offline preview as JSON").requires("dry_run")))
         .subcommand(
             cmd(
                 "undo",
@@ -147,6 +156,7 @@ pub fn build_cli() -> Command {
                 .arg(Arg::new("host"))
                 .arg(flag("remove", "take kit off that server")),
         )
+        .subcommand(cmd("doctor", "diagnose configuration and prerequisites without changing anything", "kit doctor · kit doctor --json").arg(flag("json", "print diagnostics as JSON")))
         .subcommand(
             Command::new("completion")
                 .hide(true)

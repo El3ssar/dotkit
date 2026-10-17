@@ -79,30 +79,12 @@ fn crates_io(source: &str) -> bool {
     )
 }
 
-fn plain_git_source(source: &str) -> Option<(&str, &str)> {
-    let (url, revision) = source.rsplit_once('#')?;
-    if url.contains('?')
-        || url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .is_some_and(|rest| {
-                rest.split('/')
-                    .next()
-                    .is_some_and(|host| host.contains('@'))
-            })
-    {
-        return None;
-    }
-    Some((url, revision))
-}
-
 pub(crate) fn installed_cargo_spec(bin: &str) -> Option<String> {
     let installed = cargo_install(bin)?;
     if crates_io(&installed.source) {
         Some(format!("cargo:{}@{}", installed.name, installed.version))
     } else {
-        plain_git_source(installed.source.strip_prefix("git+")?)
-            .map(|(url, _)| format!("{}:{url}", if ctx().is_mac { "cargo-git" } else { "cargo" }))
+        None
     }
 }
 
@@ -113,7 +95,7 @@ fn newer(latest: &str, current: &str) -> Option<bool> {
     )
 }
 
-fn cargo_update(name: &str, installed: &CargoInstall, check: bool) -> Option<String> {
+fn cargo_update(name: &str, bin: &str, installed: &CargoInstall, check: bool) -> Option<String> {
     let local_cargo = installed.root.join("bin/cargo");
     let cargo = if is_executable(&local_cargo) {
         local_cargo
@@ -128,7 +110,9 @@ fn cargo_update(name: &str, installed: &CargoInstall, check: bool) -> Option<Str
     let rustup = if installed.root == ctx().home.join(REMOTE_KIT).join("cargo") {
         ctx().home.join(REMOTE_KIT).join("rustup")
     } else {
-        ctx().home.join(".rustup")
+        std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ctx().home.join(".rustup"))
     };
     if rustup.is_dir() {
         env.push(("RUSTUP_HOME".into(), path_str(&rustup)));
@@ -137,7 +121,11 @@ fn cargo_update(name: &str, installed: &CargoInstall, check: bool) -> Option<Str
     let call = |args: &[&str], capture| {
         let mut command = vec![cargo.as_str()];
         command.extend_from_slice(args);
-        run_full(&command, capture, Some(&ctx().home), Some(&env), None)
+        if capture {
+            query_full(&command, 30, Some(&ctx().home), Some(&env))
+        } else {
+            run_install(name, &command, Some(&ctx().home), Some(&env))
+        }
     };
     say(&format!(
         "checking {name} (Cargo: {} {})",
@@ -173,11 +161,20 @@ fn cargo_update(name: &str, installed: &CargoInstall, check: bool) -> Option<Str
                 ));
                 let spec = format!("{}@{latest}", installed.name);
                 // Cargo decides whether a build is necessary. Never pass --force.
-                if check || call(&["install", "--locked", &spec], false).code == 0 {
+                if check {
+                    return Some(format!("cargo:{spec}"));
+                }
+                if call(&["install", "--locked", &spec], false).code == 0
+                    && cargo_install(bin).is_some_and(|actual| {
+                        actual.root == installed.root
+                            && actual.name == installed.name
+                            && actual.version == latest
+                    })
+                {
                     Some(format!("cargo:{spec}"))
                 } else {
                     fail(&format!(
-                        "{name}: Cargo update failed; recorded recipe preserved"
+                        "{name}: Cargo update did not confirm the requested installed version; recorded recipe preserved"
                     ));
                     None
                 }
@@ -189,45 +186,9 @@ fn cargo_update(name: &str, installed: &CargoInstall, check: bool) -> Option<Str
                 None
             }
         }
-    } else if let Some(source) = installed.source.strip_prefix("git+") {
-        let Some((url, revision)) = plain_git_source(source) else {
-            warn(&format!(
-                "{name}: custom Git ref needs a manual update; skipped"
-            ));
-            return None;
-        };
-        let result = run(&["git", "ls-remote", url, "HEAD"], true);
-        let Some(latest) = result
-            .stdout
-            .split_whitespace()
-            .next()
-            .filter(|_| result.code == 0)
-        else {
-            fail(&format!(
-                "{name}: could not check Git upstream; nothing installed"
-            ));
-            return None;
-        };
-        if latest == revision {
-            say(&format!("{name}: up to date (Cargo Git)"));
-        } else {
-            say(&format!("{name}: newer Cargo Git revision available"));
-            if !check
-                && call(
-                    &["install", "--locked", "--git", url, &installed.name],
-                    false,
-                )
-                .code
-                    != 0
-            {
-                fail(&format!("{name}: Cargo Git update failed"));
-                return None;
-            }
-        }
-        Some(format!(
-            "{}:{url}",
-            if ctx().is_mac { "cargo-git" } else { "cargo" }
-        ))
+    } else if installed.source.starts_with("git+") {
+        warn(&format!("{name}: Cargo Git checkouts require an explicit pinned mise recipe; automatic HEAD updates are disabled"));
+        None
     } else {
         warn(&format!(
             "{name}: custom Cargo registry needs a manual update; skipped"
@@ -259,7 +220,7 @@ fn brew_update(name: &str, spec: &str, check: bool) -> Option<String> {
     } else {
         "--formula"
     };
-    let result = run(&["brew", "outdated", "--json=v2", kind_flag, package], true);
+    let result = query(&["brew", "outdated", "--json=v2", kind_flag, package], 30);
     let data = serde_json::from_str::<Value>(&result.stdout).ok();
     let Some(outdated) = data
         .as_ref()
@@ -277,21 +238,27 @@ fn brew_update(name: &str, spec: &str, check: bool) -> Option<String> {
     } else {
         say(&format!("{name}: Homebrew update available"));
         if !check
-            && run_full(
-                &["brew", "upgrade", kind_flag, package],
-                false,
-                None,
-                None,
-                None,
-            )
-            .code
-                != 0
+            && run_install(name, &["brew", "upgrade", kind_flag, package], None, None).code != 0
         {
             fail(&format!("{name}: Homebrew update failed"));
             return None;
         }
     }
     Some(spec.into())
+}
+
+// mise returns a flat array when a tool argument is supplied, and an object
+// keyed by tool name for the complete inventory. Support both documented forms.
+fn mise_versions(value: &Value) -> Vec<&Value> {
+    match value {
+        Value::Array(versions) => versions.iter().collect(),
+        Value::Object(tools) => tools
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn mise_update(name: &str, spec: &str, check: bool) -> Option<String> {
@@ -323,19 +290,16 @@ fn mise_update(name: &str, spec: &str, check: bool) -> Option<String> {
         let exe = path_str(&mise);
         let mut cmd = vec![exe.as_str()];
         cmd.extend_from_slice(args);
-        run_full(&cmd, capture, Some(&kit), Some(&env), None)
+        if capture {
+            query_full(&cmd, 30, Some(&kit), Some(&env))
+        } else {
+            run_install(name, &cmd, Some(&kit), Some(&env))
+        }
     };
     say(&format!("checking {name} (mise)"));
     let result = call(&["ls", "--json", "--installed", &base], true);
     let data = serde_json::from_str::<Value>(&result.stdout).ok();
-    let versions: Vec<&Value> = data
-        .as_ref()
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|o| o.values())
-        .filter_map(Value::as_array)
-        .flatten()
-        .collect();
+    let versions = data.as_ref().map(mise_versions).unwrap_or_default();
     let active = versions
         .iter()
         .find(|v| v.get("active").and_then(Value::as_bool) == Some(true))
@@ -374,12 +338,29 @@ fn mise_update(name: &str, spec: &str, check: bool) -> Option<String> {
         Some(true) => {
             say(&format!("{name}: {current} → {version} (mise)"));
             let target = format!("{base}@{version}");
-            if check || call(&["use", "--global", &target], false).code == 0 {
-                Some(normalized(version))
-            } else {
-                fail(&format!("{name}: mise update failed"));
-                None
+            if check {
+                return Some(normalized(version));
             }
+            if call(&["use", "--global", &target], false).code == 0 {
+                let result = call(&["ls", "--json", "--installed", &base], true);
+                let data = serde_json::from_str::<Value>(&result.stdout).ok();
+                let confirmed = result.code == 0
+                    && data
+                        .as_ref()
+                        .map(mise_versions)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .any(|v| {
+                            v.get("version").and_then(Value::as_str) == Some(version)
+                                && v.get("active").and_then(Value::as_bool) == Some(true)
+                                && v.get("installed").and_then(Value::as_bool) == Some(true)
+                        });
+                if confirmed {
+                    return Some(normalized(version));
+                }
+            }
+            fail(&format!("{name}: mise update did not confirm the requested active installed version; recorded recipe preserved"));
+            None
         }
         None => {
             warn(&format!(
@@ -416,7 +397,10 @@ pub fn update_tools(names: &[String], check: bool) {
             next.clone()
         } else {
             let next = if let Some(cargo) = &cargo {
-                cargo_update(name, cargo, check)
+                cargo_update(name, bin, cargo, check)
+            } else if let Some(why) = crate::recipe::problem(&spec) {
+                fail(&format!("{name}: unsupported recipe: {why}; use kit add with an explicit mise/Cargo recipe"));
+                None
             } else if !pkg_available(name, p) {
                 warn(&format!(
                     "{name}: not installed here; skipped (kit sync installs missing tools)"
@@ -452,7 +436,9 @@ pub fn update_tools(names: &[String], check: bool) {
                     if pkgs[name]
                         .get(other)
                         .and_then(Value::as_str)
-                        .is_some_and(|spec| split_spec(spec).0 == base)
+                        .is_some_and(|other_spec| {
+                            split_spec(other_spec).0 == base && other_spec == spec
+                        })
                     {
                         pkgs.get_mut(name)
                             .unwrap()
@@ -476,7 +462,14 @@ pub fn update_tools(names: &[String], check: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{mise_versions, newer};
+    #[test]
+    fn mise_installed_records_accept_single_tool_array_and_inventory_object() {
+        let versions = serde_json::json!([{"version":"1.2.3","active":true,"installed":true}]);
+        let inventory = serde_json::json!({"aqua:owner/tool":versions.clone()});
+        assert_eq!(mise_versions(&versions), mise_versions(&inventory));
+        assert_eq!(mise_versions(&versions).len(), 1);
+    }
     #[test]
     fn upgrades_require_a_strictly_newer_valid_version() {
         assert_eq!(newer("1.2.3", "1.2.3"), Some(false));

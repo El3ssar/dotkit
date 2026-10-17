@@ -26,6 +26,27 @@ pub fn validate_rel(rel: &str) -> KResult<()> {
 }
 
 // --------------------------------------------------------------------------- user paths
+/// External checkouts must stay in real home directories, never traverse symlinks.
+pub fn safe_home_directory(rel: &str) -> KResult<()> {
+    validate_rel(rel)?;
+    let mut path = ctx().home.clone();
+    for part in Path::new(rel).components() {
+        path.push(part);
+        if is_link(&path) || (path.exists() && !path.is_dir()) {
+            return Err(format!(
+                "external ~/{rel}: a symlink or file blocks {}; left untouched",
+                path.display()
+            ));
+        }
+    }
+    if is_link(&path.join(".git")) {
+        return Err(format!(
+            "external ~/{rel}: .git is a symlink; left untouched"
+        ));
+    }
+    Ok(())
+}
+
 /// $HOME-relative path for a user-given path (absolute, ~/..., or relative to cwd or $HOME).
 pub fn rel_of(path: &str) -> String {
     rel_of_opt(path, false)
@@ -104,6 +125,9 @@ pub fn contains_kit(rel: &str) -> bool {
 pub fn tree_path(rel: &str) -> KResult<PathBuf> {
     validate_rel(rel)?;
     let tree = &ctx().tree;
+    if is_link(tree) || (tree.exists() && !is_real_dir(tree)) {
+        return Err("the repository's home/ must be a real directory; left untouched".into());
+    }
     let parts: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
     let mut p = tree.clone();
     for (i, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
@@ -560,6 +584,10 @@ pub fn walk_entries(
 /// Every tracked file and symlink (relative to $HOME), sorted.
 pub fn managed(prefixes: Option<&[String]>) -> Vec<String> {
     let tree = &ctx().tree;
+    if is_link(tree) || (tree.exists() && !is_real_dir(tree)) {
+        fail("the repository's home/ must be a real directory; left untouched");
+        return vec![];
+    }
     if !is_real_dir(tree) {
         return vec![];
     }
@@ -725,7 +753,7 @@ fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
             fs::copy(&s, &d)?;
         }
     }
-    Ok(())
+    fs::set_permissions(dest, fs::metadata(src)?.permissions())
 }
 
 pub fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -835,6 +863,26 @@ pub fn secret_problem(rel: &str, entry: Option<&Entry>) -> Option<String> {
 
 // --------------------------------------------------------------------------- sync state
 pub type Synced = BTreeMap<String, String>;
+
+/// Read sync state without creating snapshots or bootstrapping a state directory.
+pub fn peek_synced() -> Synced {
+    if ctx().synced.exists() {
+        return load_synced();
+    }
+    let mut synced = Synced::new();
+    for rel in managed(None) {
+        let Ok(src) = source_entry(&rel, &local_contexts()) else {
+            continue;
+        };
+        let tgt = read_home_entry(&rel);
+        if src.is_some() && same(src.as_ref(), tgt.as_ref()) {
+            if let Some(hash) = digest(tgt.as_ref()) {
+                synced.insert(rel, hash);
+            }
+        }
+    }
+    synced
+}
 
 pub fn load_synced() -> Synced {
     let cx = ctx();

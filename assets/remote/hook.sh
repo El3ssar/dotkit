@@ -39,6 +39,18 @@ targets() {
   esac
 }
 
+# Hook edits must never follow an rc file, parent directory, backup or temporary
+# file symlink. In particular ~/.fizsh may point outside the home directory.
+safe_hook_path() {
+  local rel=$1 part current="$HOME" rest=$1
+  while [ -n "$rest" ]; do
+    part=${rest%%/*}; current="$current/$part"
+    [ ! -L "$current" ] || return 1
+    case "$rest" in */*) rest=${rest#*/} ;; *) break ;; esac
+  done
+  [ ! -L "$HOME/$rel.kit-backup" ] && [ ! -L "$HOME/$rel.kit-tmp" ]
+}
+
 # delete the kit block; leaves the file alone if the end marker is missing (never truncates)
 strip_block() {
   awk -v b='^# >>> kit: ' -v e='^# <<< kit <<<' '
@@ -49,13 +61,16 @@ strip_block() {
 }
 
 install_hook() {
-  local where rel file
+  local where rel file failed=0
   while read -r where rel; do
     file="$HOME/$rel"
     if [ "$MODE" = local ] && [ -f "$MANAGED" ] && grep -qxF "$rel" "$MANAGED"; then
       continue
     fi
-    if [ -L "$file" ] && [ ! -e "$file" ]; then echo "kit: skipping broken symlink $file" >&2; continue; fi
+    if ! safe_hook_path "$rel"; then
+      echo "kit: cannot add shell hook through a symlink: $file; left untouched" >&2
+      failed=1; continue
+    fi
     [ -e "$file" ] || { mkdir -p "$(dirname "$file")"; touch "$file"; }
     [ -e "$file.kit-backup" ] || cp -p "$file" "$file.kit-backup"
     strip_block "$file"
@@ -69,11 +84,16 @@ install_hook() {
     fi
     echo "kit: hook in $file"
   done < <(targets)
+  return "$failed"
 }
 
 remove_hook() {
-  local f
+  local f failed=0
   for f in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.fizsh/.zshrc"; do
+    if ! safe_hook_path "${f#"$HOME/"}"; then
+      echo "kit: cannot remove shell hook through a symlink: $f; left untouched" >&2
+      failed=1; continue
+    fi
     [ -f "$f" ] && grep -q '^# >>> kit: ' "$f" && strip_block "$f" && echo "kit: hook removed from $f"
     [ -f "$f.kit-backup" ] || continue
     # install added a final newline the file lacked: take it back out
@@ -83,7 +103,7 @@ remove_hook() {
     # the backup is only kept if the file changed in other ways since kit was installed
     cmp -s "$f" "$f.kit-backup" && rm -f "$f.kit-backup"
   done
-  return 0
+  return "$failed"
 }
 
 case "${1:-}" in

@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 /// The scripts that run on servers, built into kit.
 const REMOTE_FILES: &[(&str, &str)] = &[
     (
+        "run-install.sh",
+        include_str!("../assets/remote/run-install.sh"),
+    ),
+    (
         "bootstrap.sh",
         include_str!("../assets/remote/bootstrap.sh"),
     ),
@@ -108,7 +112,7 @@ fn build_payload_for(dest: &Path, mode: &str, platform: &str) -> String {
     let mut tools = std::collections::BTreeMap::new();
     let mut plist = String::new();
     let mut seen_bins = std::collections::BTreeSet::new();
-    for (n, p) in crate::pkg::all_packages() {
+    for (n, p) in crate::pkg::all_packages_for(platform) {
         if mode != "local" && !p.get("remote").and_then(Value::as_bool).unwrap_or(true) {
             continue;
         }
@@ -128,41 +132,9 @@ fn build_payload_for(dest: &Path, mode: &str, platform: &str) -> String {
         if let Some(rest) = spec.strip_prefix("mise:") {
             spec = rest.into();
         }
-        if platform == "mac" && (spec.starts_with("brew:") || spec.starts_with("cask:")) {
-            let (kind, what) = spec.split_once(':').unwrap();
-            let brew = format!(
-                "brew install {}'{}'",
-                if kind == "cask" { "--cask " } else { "" },
-                what.replace('\'', "'\\''")
-            );
-            let alternative = s(&p, "linux").filter(|spec| crate::pkg::is_mise_spec(spec));
-            let fallback = alternative
-                .map(|spec| format!("mise use --global '{}'", spec.replace('\'', "'\\''")))
-                .unwrap_or_else(|| {
-                    "echo 'Homebrew is required for this Mac package' >&2; exit 1".into()
-                });
-            let script = format!("#!/bin/sh\nset -eu\nif command -v brew >/dev/null; then {brew}; else {fallback}; fi\n");
-            write_file(
-                &dest.join("commands").join(format!("{n}.sh")),
-                script.as_bytes(),
-                0o700,
-            );
-            spec = format!("cmd:{n}");
-        } else if let Some(command) = spec.strip_prefix("cmd:") {
-            if command.contains("uv tool") {
-                tools
-                    .entry("aqua:astral-sh/uv".into())
-                    .or_insert_with(|| "latest".into());
-                tools
-                    .entry("core:python".into())
-                    .or_insert_with(|| "3.12".into());
-            }
-            write_file(
-                &dest.join("commands").join(format!("{n}.sh")),
-                format!("#!/bin/sh\nset -eu\n{command}\n").as_bytes(),
-                0o700,
-            );
-            spec = format!("cmd:{n}");
+        if let Some(why) = crate::recipe::problem(&spec).filter(|_| recipe.is_some()) {
+            warn(&format!("{n}: blocked recipe {spec:?}: {why}"));
+            spec = "blocked:unsupported-recipe".into();
         } else if spec == "builtin:nvim" {
             tools.insert("aqua:neovim/neovim".into(), "0.12.6".into());
         } else if crate::pkg::is_mise_spec(&spec) {
@@ -171,7 +143,15 @@ fn build_payload_for(dest: &Path, mode: &str, platform: &str) -> String {
             spec = format!("{base}@{ver}");
             tools.insert(base, ver);
         }
-        let fb = s(&p, "linux_fallback").unwrap_or("-");
+        let fb = if platform == "linux" {
+            s(&p, "linux_fallback")
+                .filter(|s| {
+                    crate::recipe::problem(s).is_none() && crate::recipe::backend_supported(s)
+                })
+                .unwrap_or("-")
+        } else {
+            "-"
+        };
         plist += &format!("{n}\t{bin}\t{spec}\t{fb}\n");
     }
     for (key, _) in tools.clone() {
@@ -210,8 +190,9 @@ fn build_payload_for(dest: &Path, mode: &str, platform: &str) -> String {
         let reference = spec.get("ref").and_then(Value::as_str).unwrap_or("");
         if url.is_empty()
             || url.starts_with('-')
-            || url.contains(['\t', '\n', '\r'])
-            || reference.contains(['\t', '\n', '\r'])
+            || reference.starts_with('-')
+            || url.chars().any(char::is_control)
+            || reference.chars().any(char::is_control)
         {
             die("invalid external repository URL/ref");
         }
@@ -441,9 +422,13 @@ pub fn cmd_push(a: &Args) {
             continue;
         }
         let platform = ssh(host, "uname -s", true);
+        if platform.code != 0 {
+            fail(&format!("{host}: could not detect the remote OS over SSH"));
+            continue;
+        }
         let platform = match platform.stdout.trim() {
             "Darwin" => "mac",
-            "Linux" | "" => "linux",
+            "Linux" => "linux",
             _ => {
                 fail(&format!("{host}: unsupported OS"));
                 continue;
