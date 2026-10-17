@@ -323,7 +323,7 @@ const HINTS: &[(&[&str], &str)] = &[
     (&["type"], "file vs folder → kit rm it, then kit add it again"),
 ];
 
-/// [(rel, git url, ref, state)] state: ok | missing | stale
+/// [(rel, git url, ref, state)] state: ok | missing | stale | ahead | diverged
 pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> {
     let cx = ctx();
     let mut out = Vec::new();
@@ -400,7 +400,15 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
                 let wanted = g(&["rev-parse", "--verify", &format!("{r}^{{commit}}")]);
                 let exact = wanted.code == 0 && wanted.stdout.trim() == head;
                 if !exact {
-                    state = "stale";
+                    state = if wanted.code != 0 {
+                        "stale"
+                    } else if g(&["merge-base", "--is-ancestor", r, "HEAD"]).code == 0 {
+                        "ahead"
+                    } else if g(&["merge-base", "--is-ancestor", "HEAD", r]).code == 0 {
+                        "stale"
+                    } else {
+                        "diverged"
+                    };
                 }
             }
         }
@@ -710,14 +718,41 @@ pub fn cmd_status(a: &Args) {
         return;
     }
     let mut problems = !changes.is_empty();
+    let mut recipes = Vec::new();
     for (name, p) in all_packages() {
         for platform in ["mac", "linux"] {
             if let Some(spec) = crate::pkg::s(&p, platform) {
                 if let Some(why) = crate::recipe::problem(spec) {
                     problems = true;
-                    out(&format!("Unsupported recipe: {name} ({platform}): {why}. Use kit packages resolve --both or an explicit recipe."));
+                    recipes.push((name.clone(), platform, why));
                 }
             }
+        }
+    }
+    if !recipes.is_empty() {
+        out(&format!(
+            "Package recipes need attention ({}){}",
+            recipes.len(),
+            if recipes.len() <= 3 {
+                format!(
+                    ": {}",
+                    recipes
+                        .iter()
+                        .map(|(name, platform, _)| format!("{name} ({platform})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            } else {
+                String::new()
+            }
+        ));
+        out("  Installed tools are kept. Repair recipes for future installs: kit packages resolve --both");
+        if a.flag("verbose") {
+            for (name, platform, why) in recipes {
+                out(&format!("  {name} ({platform}): {why}"));
+            }
+        } else {
+            out("  kit status -v shows the reasons; unsupported sources need an explicit supported recipe");
         }
     }
     let missing = missing_tools();
@@ -757,14 +792,20 @@ pub fn cmd_status(a: &Args) {
     for (rel, _, r#ref, state) in externals_state() {
         if state != "ok" {
             problems = true;
-            let what = if state == "missing" {
-                "missing".to_string()
-            } else {
-                format!("not at {}", r#ref.unwrap_or_default())
+            let reference = r#ref.unwrap_or_default();
+            let what = match state {
+                "missing" => "missing".to_string(),
+                "ahead" => format!("newer than pin {reference}; sync will not downgrade it — review the ref in externals.json"),
+                "diverged" => format!("diverged from pin {reference}; sync will preserve local commits — review the checkout and externals.json"),
+                _ => format!("not at {reference}"),
             };
             out(&format!(
                 "External ~/{rel}: {what}{}",
-                c("2", "   → kit sync")
+                if matches!(state, "ahead" | "diverged") {
+                    String::new()
+                } else {
+                    c("2", "   → kit sync")
+                }
             ));
         }
     }

@@ -1,6 +1,6 @@
 # Reliability review — 2026-10-17
 
-This review covers `0.3.0`. Existing dotfile repositories are not automatically migrated.
+This review covers `0.3.0` and the `0.3.1` recipe migration/status corrections. Existing dotfile repositories are not automatically migrated.
 
 ## Package contract
 
@@ -101,3 +101,13 @@ not macOS sshd or SFTP/SCP.
 The reliability baseline takes inspiration from chezmoi's explicit preview/apply and doctor
 workflows ([official command overview](https://www.chezmoi.io/user-guide/command-overview/));
 this review does not assert full feature parity with chezmoi's templates or encryption.
+
+## 0.3.1 upgrade correction
+
+Explicit recipe resolution now pins legacy Cargo entries through their existing provider,
+using installed crates.io metadata on the current OS when it names the same crate. It does
+not replace Cargo with the other OS recipe or adopt an unrelated binary owner. Status
+groups recipe diagnostics and leaves detailed reasons in `status -v`, while retaining
+unsynced file/package details. External checkouts ahead of or diverged from a pin no longer
+suggest that ordinary sync can downgrade them. Unsupported sources remain visible and
+require a verified replacement; no arbitrary command/plugin is re-enabled.

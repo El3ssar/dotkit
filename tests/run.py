@@ -2646,6 +2646,43 @@ def packages_resolve_is_explicit_and_does_not_install(sb):
 
 
 @test
+def resolve_preserves_legacy_cargo_provider_and_installed_version(sb):
+    m = setup(sb); sb.stub("mise", script=MISE_STUB)
+    installed_cargo_fixture(m, crate="probe", binary="probe", version="1.0.0")
+    baseline = {PLAT: "cargo:probe", OTHER: "aqua:owner/probe@2.0.0", "remote": False}
+    m.repo_write("packages.json", json.dumps({"probe": baseline}))
+    m.kit("packages", "resolve", "--both", "probe")
+    expected = dict(baseline); expected[PLAT] = "cargo:probe@1.0.0"
+    ok(pkgs(m)["probe"] == expected, pkgs(m))
+    ok(not sb.calls("cargo") and not sb.calls("brew"), sb.calls())
+    ok(not any(" use " in c or " install " in c for c in sb.calls("mise")), sb.calls())
+
+
+@test
+def resolve_pins_existing_cargo_without_adopting_another_crate(sb):
+    m = setup(sb); sb.stub("mise", script=MISE_STUB)
+    installed_cargo_fixture(m, crate="other-crate", binary="probe", version="9.0.0")
+    m.repo_write("packages.json", json.dumps({"probe": {PLAT: "cargo:probe", OTHER: "brew:probe"}}))
+    m.kit("packages", "resolve", "--both", "probe")
+    ok(pkgs(m)["probe"][PLAT] == "cargo:probe@1.2.3", pkgs(m))
+    ok(pkgs(m)["probe"][OTHER] == "brew:probe")
+    ok(not sb.calls("cargo"), sb.calls())
+
+
+@test
+def status_groups_legacy_recipes_and_preserves_unsynced_details(sb):
+    m = setup(sb)
+    m.repo_write("packages.json", json.dumps({"probe": {PLAT: "cargo:probe", OTHER: "cmd:unsafe"}}))
+    before = (m.src / "packages.json").read_bytes()
+    result = m.kit("status")
+    has(result.out, "Package recipes need attention (2)", "Installed tools are kept", "kit packages resolve --both", "package probe")
+    hasnt(result.out, "Unsupported recipe:", "an exact version is required")
+    verbose = m.kit("status", "-v")
+    has(verbose.out, "an exact version is required", "custom install commands are not managed")
+    ok((m.src / "packages.json").read_bytes() == before, "status migrated recipes")
+
+
+@test
 def packages_resolve_queries_provider_and_reports_unresolved_casks(sb):
     m=setup(sb)
     sb.stub("mise",script='case "$1:$2" in registry:unknown) exit 1;; esac\n'+MISE_STUB)

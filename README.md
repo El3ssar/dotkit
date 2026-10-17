@@ -224,6 +224,12 @@ Existing entries remain visible for inspection, migration or removal. Repair sel
 explicitly with `kit packages resolve --both` or `kit add <name> --mac <recipe> --linux <recipe>`;
 review the saved changes with `kit status`. Resolution does not search every provider or
 promise that an arbitrary package is portable.
+Legacy unpinned Cargo recipes retain Cargo when explicitly resolved. On the current OS,
+Kit pins the installed crates.io version from Cargo metadata; otherwise it queries the
+existing provider. Unsupported plugins/custom commands require a supported replacement.
+`kit status` summarizes recipe issues; `kit status -v` shows individual reasons.
+External checkouts newer than their recorded pin are identified separately: sync preserves
+the newer commits rather than downgrading them. Review the pin in `externals.json`.
 
 Working executables from Cargo, Brew, mise or the system are preserved during normal sync;
 Kit does not install a second copy because another provider appears in the recipe. Use

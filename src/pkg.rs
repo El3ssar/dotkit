@@ -671,19 +671,18 @@ pub fn resolve_tools(names: &[String]) {
             ));
             continue;
         }
-        let Some(mac) = s(p, "mac").map(String::from) else {
+        let source = s(p, "linux")
+            .filter(|spec| crate::recipe::backend_supported(spec))
+            .or_else(|| s(p, "mac"))
+            .map(String::from);
+        let Some(source_spec) = source else {
             fail(&format!(
                 "{name}: no supported source recipe; kit add {name} --linux <recipe>"
             ));
             continue;
         };
-        if let Some(recipe) = portable_recipe(name, &mac) {
-            if s(p, "bin").is_none() {
-                if let Some(bin) = inferred_bin(name, &recipe) {
-                    p.insert("bin".into(), bin.into());
-                }
-            }
-            let recipe = pinned(&recipe);
+        if let Some(recipe) = portable_recipe(name, &source_spec) {
+            let recipe = pin_existing_source(name, p, "linux", &recipe);
             if let Some(why) = crate::recipe::problem(&recipe) {
                 fail(&format!(
                     "{name}: could not resolve a supported Linux recipe: {why}"
@@ -695,11 +694,16 @@ pub fn resolve_tools(names: &[String]) {
             if !crate::capability::check_entry(name, &candidate, false) {
                 continue;
             }
+            if s(p, "bin").is_none() {
+                if let Some(bin) = inferred_bin(name, &recipe) {
+                    p.insert("bin".into(), bin.into());
+                }
+            }
             p.insert("linux".into(), recipe.into());
             changed = true;
             note(&format!("{name}: added Linux recipe"));
         } else {
-            fail(&format!("{name}: could not resolve a Linux recipe from {mac}; kit add {name} --linux <recipe>"));
+            fail(&format!("{name}: could not resolve a Linux recipe from {source_spec}; kit add {name} --linux <recipe>"));
         }
     }
     if changed {
@@ -718,9 +722,16 @@ pub fn resolve_mac_tools(names: &[String]) {
         if s(p, "mac").is_some_and(|s| crate::recipe::problem(s).is_none()) {
             continue;
         }
-        let source = s(p, "linux")
-            .filter(|s| crate::recipe::problem(s).is_none())
-            .map(String::from)
+        // Repair the existing provider first. A legacy unpinned Cargo entry
+        // must not become an Aqua/Brew entry merely because Linux uses one.
+        let source = s(p, "mac")
+            .filter(|spec| crate::recipe::backend_supported(spec))
+            .map(|spec| pin_existing_source(name, p, "mac", spec))
+            .or_else(|| {
+                s(p, "linux")
+                    .filter(|s| crate::recipe::problem(s).is_none())
+                    .map(String::from)
+            })
             .or_else(|| mise_backend(name).map(|s| pinned(&s)));
         let Some(source) = source else {
             fail(&format!("{name}: no supported macOS recipe"));
@@ -744,6 +755,21 @@ pub fn resolve_mac_tools(names: &[String]) {
     if changed {
         save_pkgs(&pkgs);
     }
+}
+
+fn pin_existing_source(name: &str, p: &Pkg, platform: &str, spec: &str) -> String {
+    let spec = spec.strip_prefix("mise:").unwrap_or(spec);
+    let (base, version) = split_spec(spec);
+    if base.starts_with("cargo:") && version.is_none() && platform == ctx().platform {
+        if let Some(installed) =
+            crate::updates::installed_cargo_spec(package_bin_for(name, p, platform))
+        {
+            if split_spec(&installed).0 == base && crate::recipe::problem(&installed).is_none() {
+                return installed;
+            }
+        }
+    }
+    pinned(spec)
 }
 
 fn portable_recipe(name: &str, mac: &str) -> Option<String> {

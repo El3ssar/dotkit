@@ -54,7 +54,7 @@ pub fn problem(spec: &str) -> Option<String> {
     }
     let Some(version) = version else {
         return Some(
-            "an exact version is required; add the package again to resolve and pin one".into(),
+            "an exact version is required; use kit packages resolve --both to pin the existing provider".into(),
         );
     };
     if !version.chars().any(|c| c.is_ascii_digit())
