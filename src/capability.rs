@@ -215,10 +215,10 @@ pub fn check_entry(name: &str, p: &Pkg, strict: bool) -> bool {
         ("linux", ["linux-x64", "linux-arm64"]),
     ] {
         let Some(spec) = s(p, os) else {
-            warn(&format!(
-                "{name}: no {os} recipe; this package is not declared portable"
-            ));
             if strict {
+                warn(&format!(
+                    "{name}: no {os} recipe; this package is not declared portable"
+                ));
                 ok = false;
             }
             continue;

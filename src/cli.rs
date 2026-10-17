@@ -111,7 +111,7 @@ pub fn build_cli() -> Command {
                 .subcommand(Command::new("check").about("check provider artifacts for macOS/Linux x86_64/ARM64; source builds are reported separately").arg(Arg::new("names").num_args(0..)))
                 .subcommand(Command::new("update").about("check selected installed tools and update only when newer versions exist").arg(flag("check", "check versions without installing or changing recipes")).arg(Arg::new("names").num_args(1..).required(true)))
                 .subcommand(Command::new("remove").about("stop syncing selected tools; leave installed programs untouched").arg(Arg::new("names").num_args(1..).required(true)))
-                .subcommand(Command::new("resolve").about("resolve missing/unsupported Linux recipes via mise; does not install tools").arg(flag("both", "also resolve missing/unsupported macOS recipes")).arg(Arg::new("names").num_args(0..)))
+                .subcommand(Command::new("resolve").about("repair missing/unsupported Linux recipes, preserving supported providers; does not install tools").arg(flag("both", "also resolve missing/unsupported macOS recipes")).arg(Arg::new("names").num_args(0..)))
                 .subcommand(Command::new("servers").about("include selected tools in kit push").arg(Arg::new("names").num_args(1..).required(true)))
                 .subcommand(Command::new("local").about("exclude selected tools from kit push").arg(Arg::new("names").num_args(1..).required(true)))
         )
