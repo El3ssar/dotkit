@@ -140,8 +140,6 @@ fn rust_coverage(text: &str, version: &str, targets: &[String]) -> Result<(), St
 }
 
 fn check_mise(name: &str, spec: &str, targets: &[String]) -> Result<(), String> {
-    crate::remote::ensure_mise();
-    let scratch = Scratch::new()?;
     let spec = spec.strip_prefix("mise:").unwrap_or(spec);
     let (base, version) = split_spec(spec);
     let version = version.ok_or("an exact version is required")?;
@@ -170,6 +168,8 @@ fn check_mise(name: &str, spec: &str, targets: &[String]) -> Result<(), String> 
         }
         return rust_coverage(&r.stdout, &version, targets);
     }
+    crate::remote::ensure_mise();
+    let scratch = Scratch::new()?;
     let config = format!(
         "[tools]\n{} = {}\n",
         Value::from(base.clone()),
@@ -351,6 +351,34 @@ pub fn check_entry(name: &str, p: &Pkg, strict: bool) -> bool {
     }
     ok
 }
+/// A captured local source is already installed; the other OS needs a verified
+/// binary recipe, not an untested source build. Never poison fallback attempts.
+pub(crate) fn verify_counterpart(spec: &str, os: &str) -> Result<(), String> {
+    if let Some(why) = crate::recipe::problem(spec) {
+        return Err(why);
+    }
+    if is_source(spec) {
+        return Err("source builds are unverified on the other OS".into());
+    }
+    if spec.starts_with("cask:") || spec.starts_with("brew:") {
+        return Err(
+            "the counterpart must work without requiring Homebrew on the other computer".into(),
+        );
+    }
+    if spec.starts_with("builtin:") {
+        return Ok(());
+    }
+    if !have("mise") && !spec.starts_with("core:rust@") {
+        return Err("mise is needed to verify release metadata; install mise first (no tools were installed)".into());
+    }
+    let targets = if os == "linux" {
+        vec!["linux-x64".into(), "linux-arm64".into()]
+    } else {
+        vec!["macos-x64".into(), "macos-arm64".into()]
+    };
+    check_mise("counterpart", spec, &targets)
+}
+
 pub fn command(names: &[String]) {
     let pkgs = load_pkgs();
     if let Some(name) = names.iter().find(|n| !pkgs.contains_key(*n)) {

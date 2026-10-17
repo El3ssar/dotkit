@@ -648,6 +648,11 @@ fn registry_entry(name: &str) -> Option<Value> {
         .iter()
         .find(|e| {
             e.get("short").and_then(Value::as_str) == Some(&name)
+                || ["aliases", "bins"].iter().any(|field| {
+                    e.get(*field)
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(&name)))
+                })
                 || e.get("backends")
                     .and_then(Value::as_array)
                     .is_some_and(|bs| {
@@ -932,11 +937,250 @@ fn pinned(spec: &str) -> String {
     format!("{base}@{ver}")
 }
 
+fn capture_tools(names: &[String], a: &Args) {
+    if a.one("fallback").is_some() {
+        fail(
+            "use explicit --mac/--linux recipes when choosing a source fallback; nothing recorded",
+        );
+        return;
+    }
+    let valid = Regex::new(r"^[A-Za-z0-9_.+-]+$").unwrap();
+    if names
+        .iter()
+        .any(|n| n.starts_with('-') || !valid.is_match(n))
+        || a.one("bin")
+            .is_some_and(|b| b.starts_with('-') || !valid.is_match(&b))
+    {
+        fail("invalid installed package/command name; use source:package@version for explicit versions; nothing recorded");
+        return;
+    }
+    let manifest_before = std::fs::read(&ctx().pkgs).ok();
+    let before = load_pkgs();
+    let mut next = before.clone();
+    let mut messages = Vec::new();
+    for requested in names {
+        let mut key = pkg_key(requested);
+        let mut entry = next.get(&key).cloned().unwrap_or_default();
+        if let Some(bin) = a.one("bin") {
+            entry.insert("bin".into(), bin.into());
+        }
+        let registry = registry_entry(requested);
+        let installed = match crate::capture::detect(&key, &entry, registry.as_ref()) {
+            Ok(found) => found,
+            Err(why) => {
+                fail(&why);
+                return;
+            }
+        };
+        if !next.contains_key(&key) {
+            let matches: Vec<_> = next
+                .iter()
+                .filter(|(name, p)| package_bin_for(name, p, ctx().platform) == installed.binary)
+                .map(|(n, _)| n.clone())
+                .collect();
+            if matches.len() > 1 {
+                fail(&format!("{requested}: multiple tracked entries own this command; use their existing names; package list unchanged"));
+                return;
+            }
+            if let Some(existing) = matches.first() {
+                key = existing.clone();
+                entry = next[existing].clone();
+            } else if installed.provider == "Cargo"
+                && valid.is_match(&installed.identity)
+                && !installed.identity.starts_with('-')
+            {
+                key = installed.identity.clone();
+            }
+        }
+        let other = if ctx().is_mac { "linux" } else { "mac" };
+        let counterpart = match captured_counterpart(&installed, &entry, other) {
+            Ok(spec) => spec,
+            Err(why) => {
+                fail(&format!("{requested}: found {} {} locally, but no verified {other} counterpart: {why}. Package list unchanged. Choose explicit --mac/--linux recipes if you want to accept a source build.",installed.provider,installed.version));
+                return;
+            }
+        };
+        entry.insert(ctx().platform.into(), installed.recipe.clone().into());
+        entry.insert(other.into(), counterpart.clone().into());
+        entry.insert("bin".into(), installed.binary.clone().into());
+        entry.remove("linux_bin");
+        let observed = entry
+            .entry("observed")
+            .or_insert_with(|| Value::Object(Pkg::new()));
+        let Some(observed) = observed.as_object_mut() else {
+            fail(&format!(
+                "{requested}: observed installation metadata must be an object; nothing recorded"
+            ));
+            return;
+        };
+        observed.insert(ctx().platform.into(), crate::capture::receipt(&installed));
+        if a.flag("no_servers") {
+            entry.insert("remote".into(), false.into());
+        }
+        // Reuse the user's key for explicitly named binaries; all aliases still
+        // carry an exact bin field and a provider-confirmed package identity.
+        let changed = next.get(&key) != Some(&entry);
+        next.insert(key, entry);
+        messages.push(format!(
+            "{requested}: {} {} → {}: {}; {other}: {}{}",
+            installed.provider,
+            installed.version,
+            ctx().platform,
+            installed.recipe,
+            counterpart,
+            if changed { "" } else { " (already tracked)" }
+        ));
+    }
+    if std::fs::read(&ctx().pkgs).ok() != manifest_before {
+        fail("packages.json changed while checking counterparts; no captured changes were saved — retry kit add");
+        return;
+    }
+    if before != next {
+        save_pkgs(&next);
+    }
+    for message in messages {
+        say(&message);
+    }
+    note(
+        "recorded installed tools; nothing installed or upgraded — kit sync backs up these changes",
+    );
+}
+
+fn captured_counterpart(
+    found: &crate::capture::Installed,
+    entry: &Pkg,
+    os: &str,
+) -> Result<String, String> {
+    let version = if found.provider == "Homebrew" {
+        found
+            .version
+            .rsplit_once('_')
+            .filter(|(_, r)| r.chars().all(|c| c.is_ascii_digit()))
+            .map_or(found.version.as_str(), |(v, _)| v)
+    } else {
+        &found.version
+    };
+    let base = split_spec(&found.recipe).0;
+    let registry = registry_entry(&found.identity).filter(|record| {
+        let backends = record.get("backends").and_then(Value::as_array);
+        if found.provider == "Cargo" {
+            backends.is_some_and(|b| b.iter().any(|v| v.as_str() == Some(&base)))
+        } else if found.provider == "mise" {
+            backends.is_some_and(|b| b.iter().any(|v| v.as_str() == Some(&base)))
+        } else {
+            !found
+                .recipe
+                .strip_prefix("brew:")
+                .is_some_and(|n| n.contains('/'))
+                && (record.get("short").and_then(Value::as_str)
+                    == Some(found.identity.split('@').next().unwrap_or(&found.identity))
+                    || record
+                        .get("aliases")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(&found.identity))))
+        }
+    });
+    let mut approved = Vec::new();
+    if let Some(backends) = registry
+        .as_ref()
+        .and_then(|r| r.get("backends"))
+        .and_then(Value::as_array)
+    {
+        for prefix in [
+            "core:",
+            "aqua:",
+            "github:",
+            "gitlab:",
+            "forgejo:",
+            "packslip:",
+            "ubi:",
+        ] {
+            approved.extend(
+                backends
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|b| b.starts_with(prefix))
+                    .map(String::from),
+            );
+        }
+    }
+    if found.provider == "mise" {
+        approved.insert(0, base.clone());
+    }
+    if let Some(repository) = &found.repository {
+        approved.push(repository.clone());
+    }
+    let mut candidates = Vec::new();
+    if found.recipe.starts_with("builtin:") {
+        candidates.push(found.recipe.clone());
+    }
+    if matches!(found.identity.as_str(), "gcloud" | "gcloud-cli") && version == "589.0.0" {
+        candidates.push("builtin:gcloud@589.0.0".into());
+    }
+    if found.identity == "fizsh" {
+        candidates.push("builtin:fizsh".into());
+    }
+    if let Some(spec) = s(entry, os) {
+        let (existing, ver) = split_spec(spec);
+        if ver.is_some_and(|v| v.trim_start_matches('v') == version.trim_start_matches('v'))
+            && approved.contains(&existing)
+            && package_bin_for("", entry, os) == found.binary
+        {
+            candidates.push(spec.to_string());
+        }
+    }
+    candidates.extend(approved.into_iter().map(|b| format!("{b}@{version}")));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut reasons = Vec::new();
+    for spec in candidates.into_iter().take(4) {
+        if !seen.insert(spec.clone()) {
+            continue;
+        }
+        match crate::capability::verify_counterpart(&spec, os) {
+            Ok(()) => return Ok(spec),
+            Err(why) => reasons.push(format!("{spec}: {why}")),
+        }
+    }
+    // The crate's exact published release can supply an authoritative upstream
+    // repository when the catalog has no binary backend (e.g. eza). One targeted
+    // metadata request, no persistent discovery database or background scan.
+    if found.provider == "Cargo" && have("mise") {
+        if let Some(repository) = crate::capture::cargo_repository(found) {
+            let spec = format!("{repository}@{version}");
+            if seen.insert(spec.clone()) {
+                match crate::capability::verify_counterpart(&spec, os) {
+                    Ok(()) => return Ok(spec),
+                    Err(why) => reasons.push(format!("{spec}: {why}")),
+                }
+            }
+        }
+    }
+    Err(if reasons.is_empty() {
+        "no matching binary release source was found".into()
+    } else {
+        reasons.join("; ")
+    })
+}
+
 /// Record explicit recipes or resolve a bare name through Cargo ownership / mise.
 pub fn add_tools(names: &[String], a: &Args) {
     if a.flag("upgrade") {
         crate::updates::update_tools(names, false);
         return;
+    }
+    if a.one("mac").is_none() && a.one("linux").is_none() {
+        let bare = names
+            .iter()
+            .filter(|n| !n.contains(':') && !n.contains('/'))
+            .count();
+        if bare == names.len() {
+            capture_tools(names, a);
+            return;
+        }
+        if bare > 0 {
+            fail("record installed names and explicit source recipes in separate commands; package list unchanged");
+            return;
+        }
     }
     let mut pkgs = load_pkgs();
     let valid_name = Regex::new(r"^[A-Za-z0-9_.+-]+$").unwrap();

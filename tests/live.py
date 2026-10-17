@@ -69,6 +69,13 @@ def main():
         # Exercise actual mise JSON/installed state, not only fake provider fixtures.
         inventory=json.loads(run(kit,'packages','list','--json',capture=True))
         assert all(row['installed'] for row in inventory if row['name'] in pkgs), inventory
+        # Capture real installed mise ownership and verify the other OS at the same version.
+        run(kit, 'add', 'ripgrep')
+        captured=json.loads((source/'packages.json').read_text())['ripgrep']
+        assert captured['observed'][current]['provider']=='mise', captured
+        assert captured['observed'][current]['version']=='15.2.0', captured
+        assert captured[other]=='aqua:BurntSushi/ripgrep@15.2.0', captured
+        pkgs=json.loads((source/'packages.json').read_text())
         before_manifest=(source/'packages.json').read_bytes()
         selected=['ripgrep','jq','prettier'] + (['just'] if args.source else [])
         preview=run(kit,'packages','update','--check',*selected,capture=True)

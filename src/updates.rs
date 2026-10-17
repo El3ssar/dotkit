@@ -19,6 +19,13 @@ struct CargoInstall {
 }
 
 fn cargo_install(bin: &str) -> Option<CargoInstall> {
+    cargo_install_selected(bin, None, false)
+}
+fn cargo_install_selected(
+    bin: &str,
+    preferred: Option<&std::path::Path>,
+    active_only: bool,
+) -> Option<CargoInstall> {
     let mut roots = vec![ctx().home.join(".cargo")];
     if let Some(root) = std::env::var_os("CARGO_HOME") {
         roots.push(root.into());
@@ -31,6 +38,17 @@ fn cargo_install(bin: &str) -> Option<CargoInstall> {
     }
     // Prefer Cargo's explicit ownership record over a duplicate Brew copy on PATH.
     for root in roots {
+        if preferred.is_some_and(|wanted| wanted != root) {
+            continue;
+        }
+        if active_only
+            && !which(bin)
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .zip(std::fs::canonicalize(root.join("bin").join(bin)).ok())
+                .is_some_and(|(a, b)| a == b)
+        {
+            continue;
+        }
         if !is_executable(&root.join("bin").join(bin)) {
             continue;
         }
@@ -70,7 +88,7 @@ fn cargo_install(bin: &str) -> Option<CargoInstall> {
     None
 }
 
-fn crates_io(source: &str) -> bool {
+pub(crate) fn crates_io(source: &str) -> bool {
     matches!(
         source,
         "registry+https://github.com/rust-lang/crates.io-index"
@@ -165,11 +183,13 @@ fn cargo_update(name: &str, bin: &str, installed: &CargoInstall, check: bool) ->
                     return Some(format!("cargo:{spec}"));
                 }
                 if call(&["install", "--locked", &spec], false).code == 0
-                    && cargo_install(bin).is_some_and(|actual| {
-                        actual.root == installed.root
-                            && actual.name == installed.name
-                            && actual.version == latest
-                    })
+                    && cargo_install_selected(bin, Some(&installed.root), false).is_some_and(
+                        |actual| {
+                            actual.root == installed.root
+                                && actual.name == installed.name
+                                && actual.version == latest
+                        },
+                    )
                 {
                     Some(format!("cargo:{spec}"))
                 } else {
@@ -384,8 +404,40 @@ pub fn update_tools(names: &[String], check: bool) {
     for name in names {
         let p = &pkgs[name];
         let bin = package_bin_for(name, p, ctx().platform);
-        let cargo = cargo_install(bin);
         let spec = pkg_spec(p).unwrap_or("").to_string();
+        let captured = p
+            .get("observed")
+            .and_then(|o| o.get(ctx().platform))
+            .is_some();
+        let cargo = if captured {
+            let actual = match crate::capture::detect(name, p, None) {
+                Ok(actual) => actual,
+                Err(why) => {
+                    fail(&format!(
+                        "{name}: update skipped: {why}; run kit add {name} to recapture ownership"
+                    ));
+                    continue;
+                }
+            };
+            let identity = |s: &str| {
+                if s.starts_with("brew:") || s.starts_with("cask:") {
+                    s.to_string()
+                } else {
+                    split_spec(s).0
+                }
+            };
+            if identity(&actual.recipe) != identity(&spec) {
+                fail(&format!("{name}: installed source changed since capture; run kit add {name} again before updating"));
+                continue;
+            }
+            if actual.provider == "Cargo" {
+                cargo_install_selected(bin, None, true)
+            } else {
+                None
+            }
+        } else {
+            cargo_install(bin)
+        };
         let identity = cargo
             .as_ref()
             .map(|c| format!("cargo:{}:{}", c.root.display(), c.name))

@@ -38,16 +38,28 @@ Adding a folder tracks the files present when you add it. Later files stay untra
 tracked files. Package status recognizes installed executables regardless of whether they
 came from Cargo, Homebrew, mise, or your system package manager.
 
-`kit add` takes files, folders and **tools**. For a tool, kit looks up once how to install it
-and records the macOS/Linux recipes in `packages.json`; it also installs the tool locally.
-`kit sync` commits and pushes those recipes to your backup repo. On a new machine,
-`kit init <repo>` only clones the repo; **run `kit sync` to install its tools and files**.
+`kit add <tool>` records a tool **already installed here**. It identifies the actual Cargo,
+Homebrew or mise installation and records its source and installed version. It then finds a
+same-version binary counterpart for the other OS, checking release URLs and checksums for
+Intel and ARM. If ownership or the counterpart cannot be established, the package list is
+left unchanged. Recording does not install/upgrade tools or set up the Linux environment.
+Multiple plain tool names are saved together only after every item passes.
 
-Automatic lookup covers the Homebrew and mise registries, including Cargo/npm/Python tools.
-A package outside those registries needs an explicit `--mac` / `--linux` recipe; arbitrary
-packages are not universally portable. `kit add fizsh` is supported: Homebrew on macOS,
-upstream fizsh scripts with kit's portable zsh on Linux. Track your `~/.fizsh` configuration
-separately with `kit add ~/.fizsh`.
+For example, an existing Cargo installation can remain Cargo on macOS while Linux uses a
+checked upstream release binary. Homebrew remains Homebrew on the source machine; its
+observed installed version is recorded, but future Brew installs follow the current formula.
+Copied/unowned executables, custom Cargo features/profiles, custom mise options and unsupported
+sources are rejected rather than silently losing how they were installed. Kit uses provider
+receipts, its provider catalog, and (when needed) one targeted request for the exact Cargo
+release's upstream repository. It keeps no discovery database or background scan.
+
+`kit sync` commits and pushes the recipes to your backup repo. On a new computer, run
+`kit init <repo>` followed by `kit sync` to install its tools and files. An explicit source
+such as `kit add builtin:fizsh` or `kit add cargo:bookokrat@<version>` remains an advanced
+override for tools not installed yet or packages needing manual platform choices; it can
+install locally and source builds remain unverified on other destinations. Plain-name
+capture and explicit source recipes must be added in separate commands. Track your
+`~/.fizsh` configuration separately with `kit add ~/.fizsh`.
 
 ## Another machine
 
@@ -189,8 +201,8 @@ macOS rules instead. Local `sync` inclusion still follows the current platform's
 ## Package sources and portability
 
 Kit manages Homebrew formulae, selected built-in mise backends (including upstream repository
-release assets), Cargo crates, and Kit's own bootstraps. Bare names resolve through mise's
-registry; existing Cargo ownership is adopted when available. Recipes are recorded in
+release assets), Cargo crates, and Kit's own bootstraps. Bare names capture installed ownership
+and require a checked binary counterpart; explicit source names select recipes directly. Recipes are recorded in
 `packages.json`. `sync` and `push` never invent or rewrite missing recipes.
 
 **Support is checked per package, not inferred from its package manager.** When recording a
@@ -216,7 +228,7 @@ Linux libc, distribution, or macOS version. Kit reports an installation/runtime 
 than silently declaring the environment ready. Homebrew casks remain macOS-only.
 
 ```bash
-kit add ripgrep                             # resolve and pin a release
+kit add ripgrep                             # capture installed ripgrep and check the other OS
 kit add cargo:bookokrat                     # explicitly choose a source build
 kit add brew:jq                             # check Homebrew bottle coverage
 kit add github:owner/tool@1.2.3 --bin tool   # check upstream release assets via mise

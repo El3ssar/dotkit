@@ -90,8 +90,8 @@ pub fn build_cli() -> Command {
         .subcommand(
             cmd(
                 "add",
-                "track files, folders or tools with explicit platform recipes",
-                "kit add ~/.config/nvim ~/.gitconfig · kit add lazygit · kit add BurntSushi/ripgrep · kit add cargo:eza@0.23.0",
+                "track files, or capture installed tools with a checked counterpart for the other OS",
+                "kit add ~/.config/nvim ~/.gitconfig · kit add lazygit (already installed) · kit add cargo:eza@0.23.0 (explicit source)",
             )
             .arg(things(true, "FILE|TOOL"))
             .arg(flag("force", "even if it's ignored or looks like a secret"))
