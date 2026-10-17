@@ -17,7 +17,7 @@ def package_manifest_changed_during_review_is_rejected(sb):
     original = {"alpha": {"mac": "cargo:alpha@1.2.3", "linux": "cargo:alpha@1.2.3"}}
     m.repo_write("packages.json", json.dumps(original))
     changed = {"alpha": {"mac": "cargo:alpha@9.8.7", "linux": "cargo:alpha@9.8.7"}}
-    output = harness.package_dialogue(m, b"/alpha\rd\r", expected=1,
+    output = harness.package_dialogue(m, b"/alpha\rd\r\r", expected=1,
         on_ready=lambda: m.repo_write("packages.json", json.dumps(changed)))
     harness.has(output, "changed while the manager was open", "No queued actions applied")
     harness.ok(harness.pkgs(m) == changed, "stale TUI removed a concurrently changed package")
@@ -38,7 +38,7 @@ def deleted_local_file_requires_review_before_saving_deletion(sb):
 def missing_local_file_save_is_explained_and_keeps_repo(sb):
     m = harness.setup(sb)
     m.repo_write("home/one.conf", "repo version\n")
-    output = harness.package_dialogue(m, b"/one.conf\rs\r", command="files")
+    output = harness.package_dialogue(m, b"/one.conf\rs\r\r", command="files")
     harness.has(output, "Nothing to save", "no file changes queued")
     harness.ok((m.src / "home/one.conf").read_text() == "repo version\n")
 

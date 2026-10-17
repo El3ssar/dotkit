@@ -2731,7 +2731,7 @@ def packages_tui_linux_recipe_persists_on_reopen(sb):
     m.repo_write("packages.json",json.dumps({"kitty":{"mac":"cask:kitty"}}))
     package_dialogue(m,b"/kitty\rlq")
     ok("linux" not in pkgs(m)["kitty"])
-    has(package_dialogue(m,b"/kitty\rl\r"),"kitty: added Linux recipe")
+    has(package_dialogue(m,b"/kitty\rl\r\r"),"kitty: added Linux recipe")
     ok(pkgs(m)["kitty"]["linux"]=="aqua:owner/kitty@1.2.3")
     package_dialogue(m,b"/kitty\rq")
     ok(pkgs(m)["kitty"]["linux"]=="aqua:owner/kitty@1.2.3")
@@ -2764,10 +2764,10 @@ def packages_update_explicitly_upgrades_installed_brew_tool(sb):
     ok("brew upgrade --formula probe" in sb.calls("brew"), sb.calls())
 
 
-def package_dialogue(m, keys, command="packages", expected=0, on_ready=None):
+def package_dialogue(m, keys, command="packages", expected=0, on_ready=None, size=(100,26)):
     import pty, select, termios, fcntl, struct
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 26, 100, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0))
     saved = termios.tcgetattr(slave)
     proc = subprocess.Popen(KIT + [command, "--tui"], cwd=m.home, env=m.envvars,
                             stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
@@ -2805,9 +2805,9 @@ def packages_tui_stages_cancels_applies_and_restores_terminal(sb):
     before = pkgs(m)
     has(package_dialogue(m, b"/alpha\rdq"), "manifest unchanged")
     ok(pkgs(m) == before, "cancel applied staged changes")
-    package_dialogue(m, b"/alpha\rs\r")
+    package_dialogue(m, b"/alpha\rs\r\r")
     ok(pkgs(m)["alpha"]["remote"] is False)
-    package_dialogue(m, b"/alpha\rd\r")
+    package_dialogue(m, b"/alpha\rd\r\r")
     ok("alpha" not in pkgs(m) and "beta" in pkgs(m))
     package_dialogue(m, b"\x03")
     m.kit("packages", "remove", "beta", "missing", code=1)
@@ -2819,12 +2819,12 @@ def packages_tui_combines_actions_and_reverses_scope(sb):
     m = setup(sb)
     sb.stub("mise", script=MISE_STUB)
     m.repo_write("packages.json", json.dumps({"alpha":{"mac":"cargo:alpha", "remote":False}}))
-    package_dialogue(m, b"/alpha\rsl\r")
+    package_dialogue(m, b"/alpha\rsl\r\r")
     p = pkgs(m)["alpha"]
     ok("remote" not in p, "resolving overwrote the SSH toggle")
     ok(p["linux"].startswith("cargo:alpha"), p)
     before = pkgs(m)
-    package_dialogue(m, b"/alpha\rss\r")
+    package_dialogue(m, b"/alpha\rss\r\r")
     ok(pkgs(m) == before, "toggling twice did not undo the pending change")
 
 
@@ -2834,7 +2834,7 @@ def packages_tui_runs_update_before_removing_same_entry(sb):
     installed_cargo_fixture(m, crate="probe", binary="probe")
     m.repo_write("packages.json", json.dumps({"probe":{"mac":"cargo:probe", "linux":"cargo:probe@1.0.0"}}))
     sb.stub("cargo", script="""case "$1" in search) echo 'probe = "1.0.0" # test';; install) exit 99;; esac\nexit 0\n""")
-    package_dialogue(m, b"/probe\rud\r")
+    package_dialogue(m, b"/probe\rud\r\r")
     ok("probe" not in pkgs(m), "removal was overwritten")
     ok(any(" search " in call for call in sb.calls("cargo")), "removal discarded the update action")
 
@@ -2857,12 +2857,12 @@ def packages_tui_arrow_keys_and_incremental_rendering(sb):
     # CSI is normal cursor mode; SS3 is application cursor mode (common in SSH/kitty).
     for down, up in ((b"\x1b[B", b"\x1b[A"), (b"\x1bOB", b"\x1bOA")):
         m.repo_write("packages.json", json.dumps(baseline))
-        raw = package_dialogue(m, b"/probe\r" + down + b"s\r")
+        raw = package_dialogue(m, b"/probe\r" + down + b"s\r\r")
         ok(pkgs(m)["probe-b"]["remote"] is False, "Down did not select the next package")
         ok("remote" not in pkgs(m)["probe-a"])
         ok(raw.count("\x1b[2J") <= 1, "keypresses caused full-screen clears")
         m.repo_write("packages.json", json.dumps(baseline))
-        package_dialogue(m, b"/probe\r" + down + up + b"s\r")
+        package_dialogue(m, b"/probe\r" + down + up + b"s\r\r")
         ok(pkgs(m)["probe-a"]["remote"] is False, "Up did not select the previous package")
         ok("remote" not in pkgs(m)["probe-b"])
 
@@ -3017,7 +3017,7 @@ def files_tui_combines_save_and_ssh_and_cancels_without_changes(sb):
     package_dialogue(m,b"/one.conf\rspq",command="files")
     ok(m.repo_read("home/.config/demo/one.conf")=="repo\n")
     ok((m.src/".kitignore").read_bytes()==before)
-    raw=package_dialogue(m,b"/one.conf\rsp\r",command="files")
+    raw=package_dialogue(m,b"/one.conf\rsp\r\r",command="files")
     ok(m.repo_read("home/.config/demo/one.conf")=="local\n")
     rows=json.loads(m.kit("files","--json").out)
     ok(rows[0]["ssh"] is False,rows)
@@ -3029,10 +3029,10 @@ def files_tui_combines_save_and_ssh_and_cancels_without_changes(sb):
 def files_tui_take_repo_backs_up_and_untracking_keeps_local(sb):
     m=setup(sb,{".config/demo/one.conf":"repo\n"},add=[".config/demo"])
     m.write(".config/demo/one.conf","local\n")
-    package_dialogue(m,b"/one.conf\rr\r",command="files")
+    package_dialogue(m,b"/one.conf\rr\r\r",command="files")
     ok(m.read(".config/demo/one.conf")=="repo\n")
     ok(any(p.read_text()=="local\n" for p in (m.state/"backups").rglob("one.conf")))
-    package_dialogue(m,b"/one.conf\rd\r",command="files")
+    package_dialogue(m,b"/one.conf\rd\r\r",command="files")
     ok(m.exists(".config/demo/one.conf") and not m.repo_has("home/.config/demo/one.conf"))
 
 
@@ -3041,7 +3041,7 @@ def files_tui_detects_files_changed_while_reviewing(sb):
     m=setup(sb,{".config/demo/one.conf":"repo\n"},add=[".config/demo"])
     m.write(".config/demo/one.conf","local\n")
     before=(m.src/".kitignore").read_bytes()
-    raw=package_dialogue(m,b"/one.conf\rsp\r",command="files",expected=1,
+    raw=package_dialogue(m,b"/one.conf\rsp\r\r",command="files",expected=1,
         on_ready=lambda:m.write(".config/demo/one.conf","newer edit\n"))
     has(raw,"changed while the manager was open")
     ok(m.repo_read("home/.config/demo/one.conf")=="repo\n")
@@ -3053,7 +3053,7 @@ def files_tui_diff_is_read_only_and_scope_toggles_are_reversible(sb):
     m=setup(sb,{".config/demo/one.conf":"repo\n"},add=[".config/demo"])
     m.write(".config/demo/one.conf","local\n")
     before=(m.src/".kitignore").read_bytes()
-    package_dialogue(m,b"/one.conf\rvsvapp\r",command="files")
+    package_dialogue(m,b"/one.conf\rvsvapp\r\r",command="files")
     ok(m.repo_read("home/.config/demo/one.conf")=="repo\n")
     ok((m.src/".kitignore").read_bytes()==before)
 
