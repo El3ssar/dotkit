@@ -2,10 +2,11 @@
 use crate::cli::Args;
 use crate::core::guard_repo;
 use crate::pkg::{all_packages, load_pkgs, pkg_available, s, save_pkgs, Pkg};
+use crate::tui::{Editor, Outcome};
 use crate::util::*;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::Constraint,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
@@ -57,7 +58,15 @@ fn ssh_enabled(p: &Pkg) -> bool {
 pub fn command(args: &Args) {
     if let Some((action, sub)) = args.subcommand() {
         if action == "list" {
-            inventory();
+            if args.flag("json") || sub.flag("json") {
+                inventory_json();
+            } else {
+                inventory();
+            }
+            return;
+        }
+        if action == "check" {
+            crate::capability::command(&sub.many("names"));
             return;
         }
         let action = match action.as_str() {
@@ -81,20 +90,24 @@ pub fn command(args: &Args) {
             }
         }
         if exit_code() == 0 {
+            if matches!(action, Action::Resolve) && sub.flag("both") {
+                crate::pkg::resolve_tools(&names);
+                crate::pkg::resolve_mac_tools(&names);
+                return;
+            }
             if matches!(action, Action::Update) {
                 crate::updates::update_tools(&names, sub.flag("check"));
                 return;
             }
-            apply(names.into_iter().map(|n| (n, action.into())).collect());
+            apply(
+                names.into_iter().map(|n| (n, action.into())).collect(),
+                None,
+            );
         }
         return;
     }
     if args.flag("json") {
-        let tracked = load_pkgs();
-        let rows: Vec<_> = all_packages().into_iter().map(|(name, recipe)| {
-            serde_json::json!({"installed":pkg_available(&name, &recipe), "builtin":!tracked.contains_key(&name), "name":name, "recipe":recipe})
-        }).collect();
-        out(&serde_json::to_string_pretty(&rows).unwrap());
+        inventory_json();
     } else if args.flag("tui") || (io::stdin().is_terminal() && io::stdout().is_terminal()) {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             fail(
@@ -103,13 +116,21 @@ pub fn command(args: &Args) {
             return;
         }
         match editor() {
-            Ok(plan) if !plan.is_empty() => apply(plan),
-            Ok(_) => say("package manifest unchanged"),
+            Ok((plan, snapshot)) if !plan.is_empty() => apply(plan, Some(&snapshot)),
+            Ok(_) => say("no package actions applied (manifest unchanged by this session)"),
             Err(e) => fail(&format!("package manager: {e}")),
         }
     } else {
         inventory();
     }
+}
+
+fn inventory_json() {
+    let tracked = load_pkgs();
+    let rows: Vec<_> = all_packages().into_iter().map(|(name, recipe)| {
+            serde_json::json!({"installed":pkg_available(&name, &recipe), "builtin":!tracked.contains_key(&name), "coverage":crate::capability::summary(&recipe), "name":name, "recipe":recipe})
+        }).collect();
+    out(&serde_json::to_string_pretty(&rows).unwrap());
 }
 
 fn inventory() {
@@ -139,6 +160,7 @@ fn inventory() {
             recipe(s(&p, "mac")),
             recipe(s(&p, "linux"))
         ));
+        out(&format!("    coverage: {}", crate::capability::summary(&p)));
         if let Some(fallback) = s(&p, "linux_fallback") {
             out(&format!("    fallback: {}", recipe(Some(fallback))));
         }
@@ -157,8 +179,12 @@ fn clean(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn apply(plan: BTreeMap<String, Pending>) {
+fn apply(plan: BTreeMap<String, Pending>, snapshot: Option<&[u8]>) {
     guard_repo();
+    if snapshot.is_some_and(|old| std::fs::read(&ctx().pkgs).unwrap_or_default() != old) {
+        fail("packages.json changed while the manager was open; reopen kit packages before applying. No queued actions applied.");
+        return;
+    }
     let mut pkgs = load_pkgs();
     // Validate the entire batch before changing any entry.
     for name in plan.keys() {
@@ -217,14 +243,6 @@ fn apply(plan: BTreeMap<String, Pending>) {
     }
 }
 
-// Ratatui installs a panic hook; this guard also restores the terminal on normal/error returns.
-struct RestoreTerminal;
-impl Drop for RestoreTerminal {
-    fn drop(&mut self) {
-        ratatui::restore();
-    }
-}
-
 struct PackageEditor {
     tracked: BTreeSet<String>,
     entries: Vec<(String, Pkg, bool)>,
@@ -235,15 +253,14 @@ struct PackageEditor {
     searching: bool,
     message: String,
     page_rows: usize,
-}
-
-enum Outcome {
-    Apply,
-    Cancel,
+    snapshot: Vec<u8>,
+    overlay: Option<(bool, String)>,
+    overlay_scroll: u16,
 }
 
 impl PackageEditor {
     fn load() -> Self {
+        let snapshot = std::fs::read(&ctx().pkgs).unwrap_or_default();
         let tracked = load_pkgs().into_keys().collect();
         let entries = all_packages()
             .into_iter()
@@ -262,6 +279,9 @@ impl PackageEditor {
             searching: false,
             message: "Nothing changes until Apply. Updates check selected tools through their installed provider.".into(),
             page_rows: 5,
+            snapshot,
+            overlay: None,
+            overlay_scroll: 0,
         }
     }
 
@@ -275,6 +295,13 @@ impl PackageEditor {
             .collect()
     }
 
+    fn hidden_selected(&self) -> usize {
+        let query = self.query.to_lowercase();
+        self.selected
+            .iter()
+            .filter(|name| !name.to_lowercase().contains(&query))
+            .count()
+    }
     fn current(&self) -> Option<&str> {
         self.visible()
             .get(self.table.selected().unwrap_or(0))
@@ -304,6 +331,43 @@ impl PackageEditor {
             && matches!(key.code, KeyCode::Char('c' | 'd'))
         {
             return Some(Outcome::Cancel);
+        }
+        // Modified character chords are not plain action keys (Ctrl-U must not update tools).
+        // Arrow/navigation modifiers remain available for terminal key-sequence compatibility.
+        if matches!(key.code, KeyCode::Char(_))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        if self.page_rows == 0 {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Some(Outcome::Cancel),
+                _ => None,
+            };
+        }
+        if let Some((review, _)) = &self.overlay {
+            match key.code {
+                KeyCode::Enter if *review => return Some(Outcome::Apply),
+                KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::Tab => self.overlay = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_add(1)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_add(self.page_rows as u16)
+                }
+                KeyCode::PageUp => {
+                    self.overlay_scroll = self.overlay_scroll.saturating_sub(self.page_rows as u16)
+                }
+                KeyCode::Home => self.overlay_scroll = 0,
+                KeyCode::End => self.overlay_scroll = u16::MAX,
+                _ => {}
+            }
+            return None;
         }
         // Let Crossterm decode normal, application-mode and modified arrow sequences.
         match key.code {
@@ -353,6 +417,51 @@ impl PackageEditor {
             return None;
         }
         match key.code {
+            KeyCode::Char('?') => {
+                self.overlay = Some((false, "PACKAGE MANAGER
+
+Space toggles selection; a selects matching tracked packages; A clears selection while keeping queued actions. Actions affect ALL selected packages, including hidden matches; with no selection, only the cursor row. c clears selection and pending actions.
+
+/ filters names; Enter finishes search, Esc keeps the filter. Clear it by pressing / then Enter. Arrows, j/k, Page Up/Down, Home/End navigate.
+
+u toggles update, checking the existing installation's provider before upgrading. d toggles untracking; installed programs stay. l toggles explicit missing/unsupported Linux recipe resolution. Existing supported recipes stay. s toggles inclusion in kit push; local sync is unaffected.
+
+Blue values are pending. More than one action can be queued per package. Tab reviews ALL pending actions, including hidden rows. Enter applies; q/Esc cancels the manager. Built-in dependencies are read-only.
+
+No provider queries or installation happen while browsing. `kit packages check` checks provider artifacts; source builds need destination testing.
+
+Esc / ? closes help.".into()));
+                self.overlay_scroll = 0;
+            }
+            KeyCode::Tab => {
+                let lines = self
+                    .queued
+                    .iter()
+                    .map(|(name, p)| {
+                        let mut actions = vec![];
+                        if let Some(ssh) = p.ssh {
+                            actions.push(if ssh {
+                                "include in SSH"
+                            } else {
+                                "exclude from SSH"
+                            });
+                        }
+                        if p.resolve {
+                            actions.push("resolve Linux recipe");
+                        }
+                        if p.update {
+                            actions.push("check and update installation");
+                        }
+                        if p.remove {
+                            actions.push("stop tracking (keep installed)");
+                        }
+                        format!("{}: {}", clean(name), actions.join("; "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.overlay = Some((true, format!("REVIEW ALL PENDING ACTIONS\n\n{}\n\nEnter applies these actions. Esc / Tab returns to editing. Ctrl-C cancels.", if lines.is_empty() { "Nothing queued." } else { &lines })));
+                self.overlay_scroll = 0;
+            }
             KeyCode::Char('q') | KeyCode::Esc => return Some(Outcome::Cancel),
             KeyCode::Enter => return Some(Outcome::Apply),
             KeyCode::Char('/') => {
@@ -377,6 +486,7 @@ impl PackageEditor {
                     }
                 }
             }
+            KeyCode::Char('A') => self.selected.clear(),
             KeyCode::Char('c') => {
                 self.queued.clear();
                 self.selected.clear();
@@ -430,32 +540,51 @@ impl PackageEditor {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        if area.width < 35 || area.height < 12 {
-            frame.render_widget(Paragraph::new("Window too small. Resize to browse packages.\nq / Esc: cancel   Enter: apply queued actions"), area);
+        if area.width < 40 || area.height < 15 {
+            self.page_rows = 0;
+            frame.render_widget(Paragraph::new("Window too small. Resize to browse packages.\nq / Esc: cancel. Resize to inspect before applying."), area);
             return;
         }
-        let [heading, search, table_area, details, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Min(3),
-            Constraint::Length(6),
-            Constraint::Length(5),
-        ])
-        .areas(area);
+        let [heading, search, table_area, details, footer] = crate::tui::panels(area, true);
+        let compact = area.width < 90 || area.height < 23;
         self.page_rows = table_area.height.saturating_sub(3).max(1) as usize;
+        if let Some((review, text)) = &self.overlay {
+            crate::tui::overlay(
+                frame,
+                if *review {
+                    " Review · ↑↓/PgUp/PgDn scroll · Enter applies · Esc returns "
+                } else {
+                    " Help · ↑↓/PgUp/PgDn scroll · Esc closes "
+                },
+                text,
+                &mut self.overlay_scroll,
+            );
+            return;
+        }
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "KIT · Packages",
                     Style::default().fg(Color::Cyan).bold(),
                 )),
-                Line::from(format!(
-                    "{} tracked · {} built-in · {} selected · {} queued",
-                    self.tracked.len(),
-                    self.entries.len() - self.tracked.len(),
-                    self.selected.len(),
-                    self.queued.values().map(Pending::count).sum::<usize>()
-                )),
+                Line::from(if compact {
+                    format!(
+                        "{} tracked · {} selected ({} hidden) · {} pending",
+                        self.tracked.len(),
+                        self.selected.len(),
+                        self.hidden_selected(),
+                        self.queued.values().map(Pending::count).sum::<usize>()
+                    )
+                } else {
+                    format!(
+                        "{} tracked · {} built-in · {} selected ({} hidden) · {} pending",
+                        self.tracked.len(),
+                        self.entries.len() - self.tracked.len(),
+                        self.selected.len(),
+                        self.hidden_selected(),
+                        self.queued.values().map(Pending::count).sum::<usize>()
+                    )
+                }),
             ]),
             heading,
         );
@@ -471,7 +600,15 @@ impl PackageEditor {
                 Color::DarkGray
             }));
         frame.render_widget(
-            Paragraph::new(self.query.as_str()).block(search_block),
+            Paragraph::new(self.query.as_str())
+                .scroll((
+                    0,
+                    (Line::from(self.query.as_str())
+                        .width()
+                        .saturating_sub(search.width.saturating_sub(3) as usize))
+                    .min(u16::MAX as usize) as u16,
+                ))
+                .block(search_block),
             search,
         );
         if self.searching {
@@ -491,8 +628,53 @@ impl PackageEditor {
                 let enabled = pending.ssh.unwrap_or_else(|| ssh_enabled(p));
                 let blue = Style::default().fg(Color::LightBlue);
                 let linux = s(p, "linux")
+                    .filter(|s| crate::recipe::problem(s).is_none())
                     .map(|v| v.split(':').next().unwrap_or(v))
                     .unwrap_or("missing");
+                if compact {
+                    let mut summary = Vec::new();
+                    if pending.ssh.is_some() {
+                        summary.push(if enabled { "SSH+" } else { "SSH-" });
+                    }
+                    if pending.update {
+                        summary.push("update");
+                    }
+                    if pending.resolve {
+                        summary.push("resolve");
+                    }
+                    if pending.remove {
+                        summary.push("untrack");
+                    }
+                    return Row::new(vec![
+                        Cell::from(if self.selected.contains(name) {
+                            "[x]"
+                        } else if builtin {
+                            " — "
+                        } else {
+                            "[ ]"
+                        }),
+                        Cell::from(format!(
+                            "{}{}",
+                            clean(name),
+                            if builtin { " [kit]" } else { "" }
+                        )),
+                        Cell::from(if summary.is_empty() {
+                            if enabled {
+                                "SSH included"
+                            } else {
+                                "SSH excluded"
+                            }
+                            .to_string()
+                        } else {
+                            summary.join(" · ")
+                        })
+                        .style(if pending.count() > 0 {
+                            blue
+                        } else {
+                            Style::default()
+                        }),
+                    ]);
+                }
                 Row::new(vec![
                     Cell::from(if self.selected.contains(name) {
                         "[x]"
@@ -502,9 +684,9 @@ impl PackageEditor {
                         "[ ]"
                     }),
                     Cell::from(if builtin {
-                        format!("{name} [kit]")
+                        format!("{} [kit]", clean(name))
                     } else {
-                        name.clone()
+                        clean(name)
                     }),
                     Cell::from(if enabled { "included" } else { "excluded" }).style(
                         if pending.ssh.is_some() {
@@ -546,24 +728,36 @@ impl PackageEditor {
             .collect();
         let table = Table::new(
             rows,
-            [
-                Constraint::Length(3),
-                Constraint::Min(12),
-                Constraint::Length(14),
-                Constraint::Length(7),
-                Constraint::Length(12),
-                Constraint::Length(9),
-            ],
+            if compact {
+                vec![
+                    Constraint::Length(3),
+                    Constraint::Percentage(42),
+                    Constraint::Min(12),
+                ]
+            } else {
+                vec![
+                    Constraint::Length(3),
+                    Constraint::Min(12),
+                    Constraint::Length(14),
+                    Constraint::Length(7),
+                    Constraint::Length(12),
+                    Constraint::Length(9),
+                ]
+            },
         )
         .header(
-            Row::new([
-                "",
-                "Package",
-                "SSH deployment",
-                "Update",
-                "Linux recipe",
-                "Tracking",
-            ])
+            Row::new(if compact {
+                vec!["", "Package", "Pending / SSH"]
+            } else {
+                vec![
+                    "",
+                    "Package",
+                    "SSH deployment",
+                    "Update",
+                    "Linux recipe",
+                    "Tracking",
+                ]
+            })
             .style(Style::default().bold()),
         )
         .block(
@@ -586,78 +780,103 @@ impl PackageEditor {
             } else {
                 "excluded from kit push"
             };
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(format!("macOS: {}", recipe(s(p, "mac")))),
-                    Line::from(format!("Linux: {}", recipe(s(p, "linux")))),
-                    Line::from(format!(
-                        "Fallback: {}",
-                        s(p, "linux_fallback")
-                            .map(|v| recipe(Some(v)))
-                            .unwrap_or_else(|| "none".into())
-                    )),
-                    Line::from(format!(
-                        "SSH deployment: {ssh}. This setting affects kit push only."
+            if compact {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{} · {} · {ssh}",
+                        clean(name),
+                        if *installed {
+                            "installed"
+                        } else {
+                            "missing here"
+                        }
                     ))
-                    .style(if pending.ssh.is_some() {
-                        Style::default().fg(Color::LightBlue)
-                    } else {
-                        Style::default()
-                    }),
-                ])
-                .block(Block::bordered().title(format!(
-                    " {name} · {} ",
-                    if *installed {
-                        "installed"
-                    } else {
-                        "missing here"
-                    }
-                ))),
-                details,
-            );
+                    .block(Block::bordered().title(" Cursor package · ? help · Tab review ")),
+                    details,
+                );
+            } else {
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(format!("macOS: {}", recipe(s(p, "mac")))),
+                        Line::from(format!("Linux: {}", recipe(s(p, "linux")))),
+                        Line::from(format!(
+                            "Coverage: {} (kit packages check {})",
+                            crate::capability::summary(p),
+                            name
+                        )),
+                        Line::from(format!(
+                            "SSH deployment: {ssh}. This setting affects kit push only."
+                        ))
+                        .style(if pending.ssh.is_some() {
+                            Style::default().fg(Color::LightBlue)
+                        } else {
+                            Style::default()
+                        }),
+                    ])
+                    .block(Block::bordered().title(format!(
+                        " {name} · {} ",
+                        if *installed {
+                            "installed"
+                        } else {
+                            "missing here"
+                        }
+                    ))),
+                    details,
+                );
+            }
         } else {
             frame.render_widget(
                 Paragraph::new("No matching packages").block(Block::bordered().title(" Recipes ")),
                 details,
             );
         }
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(self.message.as_str()).style(Style::default().fg(Color::Cyan)),
-                Line::from("↑↓ move · Space select · a select all · / search"),
-                Line::from("u toggle update · d toggle tracking · l toggle resolve · s toggle SSH"),
-                Line::from("Enter: APPLY QUEUED ACTIONS     q / Esc: CANCEL     c: clear queue")
+        if compact {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("? help · Tab review · / search · Space select"),
+                    Line::from(self.message.as_str()).cyan(),
+                    Line::from("Enter APPLY · q/Esc CANCEL · blue=pending").bold(),
+                ]),
+                footer,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(self.message.as_str()).style(Style::default().fg(Color::Cyan)),
+                    Line::from(
+                        "↑↓ move · Space select · a select all · / search · ? help · Tab review",
+                    ),
+                    Line::from(
+                        "u toggle update · d toggle tracking · l toggle resolve · s toggle SSH",
+                    ),
+                    Line::from(
+                        "Enter: APPLY QUEUED ACTIONS     q / Esc: CANCEL     c: clear queue",
+                    )
                     .bold(),
-            ])
-            .block(Block::default().borders(Borders::TOP)),
-            footer,
-        );
+                ])
+                .block(Block::default().borders(Borders::TOP)),
+                footer,
+            );
+        }
     }
 }
 
-fn editor() -> io::Result<BTreeMap<String, Pending>> {
+fn editor() -> io::Result<(BTreeMap<String, Pending>, Vec<u8>)> {
     // Load metadata and inspect installed tools before switching the terminal to raw mode.
     let mut app = PackageEditor::load();
-    let _restore = RestoreTerminal;
-    let mut terminal = ratatui::try_init()?;
-    loop {
-        terminal.draw(|frame| app.render(frame))?;
-        loop {
-            match event::read()? {
-                Event::Key(key) => {
-                    match app.key(key) {
-                        Some(Outcome::Apply) => return Ok(app.queued),
-                        Some(Outcome::Cancel) => return Ok(BTreeMap::new()),
-                        None => {}
-                    }
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                        break;
-                    }
-                }
-                Event::Resize(_, _) => break,
-                _ => {}
-            }
-        }
+    if crate::tui::run(&mut app)? {
+        Ok((app.queued, app.snapshot))
+    } else {
+        Ok((BTreeMap::new(), app.snapshot))
+    }
+}
+
+impl Editor for PackageEditor {
+    fn render(&mut self, frame: &mut Frame) {
+        PackageEditor::render(self, frame);
+    }
+    fn key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        PackageEditor::key(self, key)
     }
 }
 
@@ -685,6 +904,9 @@ mod tests {
             searching: false,
             message: "Nothing changes until Apply.".into(),
             page_rows: 5,
+            snapshot: vec![],
+            overlay: None,
+            overlay_scroll: 0,
         }
     }
     fn press(app: &mut PackageEditor, code: KeyCode) -> Option<Outcome> {
@@ -813,5 +1035,52 @@ mod tests {
             press(&mut app, KeyCode::Char('q')),
             Some(Outcome::Cancel)
         ));
+    }
+    #[test]
+    fn compact_panes_keep_rows_apply_and_hidden_batch_scope_visible() {
+        let mut app = fixture(3);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('/'));
+        for c in "probe-001".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let screen = text(&terminal);
+        assert!(screen.contains("probe-001"), "{screen}");
+        assert!(screen.contains("1 hidden"), "{screen}");
+        assert!(screen.contains("Enter APPLY"), "{screen}");
+        assert!(screen.contains("? help"), "{screen}");
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Tab);
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(text(&terminal).contains("probe-000"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.queued.len(), 1, "help must not stage actions");
+    }
+    #[test]
+    fn tiny_panes_cannot_apply_actions_they_cannot_show() {
+        let mut app = fixture(1);
+        press(&mut app, KeyCode::Char('d'));
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(press(&mut app, KeyCode::Enter).is_none());
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('q')),
+            Some(Outcome::Cancel)
+        ));
+    }
+    #[test]
+    fn modified_character_chords_do_not_stage_actions() {
+        let mut app = fixture(1);
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for c in ['s', 'u', 'l', 'p', 'r'] {
+                app.key(KeyEvent::new(KeyCode::Char(c), modifier));
+            }
+        }
+        assert!(app.queued.is_empty());
     }
 }

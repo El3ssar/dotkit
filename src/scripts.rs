@@ -8,6 +8,8 @@ use crate::util::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub struct Meta {
@@ -17,6 +19,25 @@ pub struct Meta {
     pub errors: Vec<String>,
 }
 
+/// Repository hooks must be ordinary files. Nonblocking, no-follow open keeps
+/// even a concurrently replaced FIFO/symlink from hanging metadata inspection.
+pub(crate) fn read_script(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("{}: cannot read regular hook file: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!(
+            "{}: hooks must be regular files, not directories, symlinks or special files",
+            path.display()
+        ));
+    }
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|e| e.to_string())?;
+    Ok(data)
+}
+
 pub fn script_meta(path: &Path) -> Meta {
     let mut m = Meta {
         on: None,
@@ -24,7 +45,14 @@ pub fn script_meta(path: &Path) -> Meta {
         watch: vec![],
         errors: vec![],
     };
-    let text = String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned();
+    let bytes = match read_script(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            m.errors.push(error);
+            return m;
+        }
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     let header = regex::Regex::new(r"^#\s*kit:\s*(\w+)\s*=\s*(.+)").unwrap();
     let trailing = regex::Regex::new(r"\s+#.*$").unwrap();
     for line in text.lines() {
@@ -38,7 +66,15 @@ pub fn script_meta(path: &Path) -> Meta {
         let key = caps[1].to_lowercase();
         let val = trailing.replace(&caps[2], "").trim().to_string();
         match key.as_str() {
-            "watch" => m.watch.extend(val.split_whitespace().map(String::from)),
+            "watch" => {
+                for rel in val.split_whitespace() {
+                    if let Err(e) = crate::core::validate_rel(rel) {
+                        m.errors.push(format!("invalid watched path: {e}"));
+                    } else {
+                        m.watch.push(rel.into());
+                    }
+                }
+            }
             "on" => {
                 let v = val.to_lowercase();
                 if v != "mac" && v != "linux" {
@@ -66,7 +102,7 @@ pub fn script_meta(path: &Path) -> Meta {
 pub fn script_hash(path: &Path, meta: &Meta) -> String {
     let home = &ctx().home;
     let mut h = Sha256::new();
-    h.update(fs::read(path).unwrap_or_default());
+    h.update(read_script(path).unwrap_or_default());
     for rel in &meta.watch {
         let f = home.join(rel);
         if f.is_dir() {
@@ -98,6 +134,10 @@ fn done_map() -> serde_json::Map<String, Value> {
 /// [(path, meta, state)] state: pending | done | skipped
 pub fn script_status() -> Vec<(PathBuf, Meta, &'static str)> {
     let cx = ctx();
+    if is_link(&cx.scripts) || (cx.scripts.exists() && !is_real_dir(&cx.scripts)) {
+        fail("the repository's scripts/ must be a real directory; move the invalid entry aside before sync");
+        return vec![];
+    }
     let done = done_map();
     let mut files: Vec<PathBuf> = fs::read_dir(&cx.scripts)
         .map(|rd| {
@@ -113,7 +153,9 @@ pub fn script_status() -> Vec<(PathBuf, Meta, &'static str)> {
         .map(|f| {
             let meta = script_meta(&f);
             let name = f.file_name().unwrap().to_string_lossy().into_owned();
-            let state = if meta.on.as_deref().is_some_and(|on| on != cx.platform) {
+            let state = if !meta.errors.is_empty() {
+                "pending"
+            } else if meta.on.as_deref().is_some_and(|on| on != cx.platform) {
                 "skipped"
             } else if meta.run == "always" {
                 "pending"
@@ -167,7 +209,10 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
             }
         }
         for e in &meta.errors {
-            warn(&format!("scripts/{}: {e}", name(&f)));
+            fail(&format!("scripts/{}: {e}", name(&f)));
+        }
+        if !meta.errors.is_empty() {
+            continue;
         }
         if state == "skipped" || (state == "done" && !force) {
             continue;
@@ -177,7 +222,10 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
             continue;
         }
         say(&format!("running script {}", name(&f)));
-        let env = vec![("KIT_SOURCE".to_string(), path_str(&cx.source))];
+        let mut env = vec![("KIT_SOURCE".to_string(), path_str(&cx.source))];
+        if let Ok(timeout) = std::env::var("KIT_SCRIPT_TIMEOUT") {
+            env.push(("KIT_INSTALL_TIMEOUT".into(), timeout));
+        }
         let fstr = path_str(&f);
         // on Linux, scripts get the kit's tools (bat, delta, …) the same way your kit shell does
         let kit_env = cx.home.join(REMOTE_KIT).join("bin/kit-env");
@@ -193,7 +241,15 @@ pub fn run_scripts(names: Option<&[String]>, force: bool, dry_run: bool) {
         } else {
             vec!["bash".into(), fstr.clone()]
         };
-        if run_full(&cmd, false, Some(&cx.home), Some(&env), None).code == 0 {
+        if run_install(
+            &format!("script-{}", name(&f)),
+            &cmd,
+            Some(&cx.home),
+            Some(&env),
+        )
+        .code
+            == 0
+        {
             done.insert(name(&f), Value::from(script_hash(&f, &meta)));
             save_json(&cx.script_state, &Value::Object(done.clone()));
         } else {

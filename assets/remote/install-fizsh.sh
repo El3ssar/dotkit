@@ -9,7 +9,9 @@ mkdir -p "$KIT/opt"
 tmp=$(mktemp -d "$KIT/opt/fizsh-install.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 if [ "$#" -gt 0 ]; then cp "$1" "$tmp/source.tar.gz"
-else curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 "https://codeload.github.com/zsh-users/fizsh/tar.gz/$revision" -o "$tmp/source.tar.gz"; fi
+elif command -v curl >/dev/null; then curl -fsSL --retry 3 --connect-timeout 20 --max-time 300 "https://codeload.github.com/zsh-users/fizsh/tar.gz/$revision" -o "$tmp/source.tar.gz"
+elif command -v wget >/dev/null; then wget -q -T 300 -O "$tmp/source.tar.gz" "https://codeload.github.com/zsh-users/fizsh/tar.gz/$revision"
+else echo 'kit: install curl or wget and CA certificates first' >&2; exit 1; fi
 if command -v sha256sum >/dev/null; then actual=$(sha256sum "$tmp/source.tar.gz")
 else actual=$(shasum -a 256 "$tmp/source.tar.gz"); fi
 [ "${actual%% *}" = "$checksum" ] || { echo 'kit: fizsh source checksum mismatch' >&2; exit 1; }

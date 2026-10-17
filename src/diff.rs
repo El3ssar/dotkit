@@ -8,24 +8,28 @@ fn hidden(e: Option<&Entry>) -> bool {
     matches!(e, Some(Entry::File(b, _)) if secret_hit(b).is_some())
 }
 
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 fn lines_of(e: Option<&Entry>) -> String {
     match e {
         None => String::new(),
-        Some(Entry::Link(t)) => format!("symlink -> {t}\n"),
+        Some(Entry::Link(t)) => format!("symlink -> {}\n", safe_text(t)),
         Some(Entry::Dir) => "(a folder)\n".into(),
         Some(Entry::Other) => "(a special file)\n".into(),
         Some(Entry::Unreadable) => "(unreadable)\n".into(),
         Some(Entry::File(b, _)) => {
             let text = String::from_utf8_lossy(b);
-            text.chars()
-                .map(|ch| {
-                    if (ch as u32) < 0x20 && ch != '\n' && ch != '\t' || ch == '\x7f' {
-                        '\u{fffd}'
-                    } else {
-                        ch
-                    }
-                })
-                .collect()
+            safe_text(&text)
         }
     }
 }
@@ -39,6 +43,11 @@ pub fn diff_text(
     new_label: &str,
     title: &str,
 ) -> String {
+    let safe_rel = safe_text(rel).replace(['\n', '\t'], "�");
+    let rel = safe_rel.as_str();
+    let old_label = safe_text(old_label).replace(['\n', '\t'], "�");
+    let new_label = safe_text(new_label).replace(['\n', '\t'], "�");
+    let title = safe_text(title).replace(['\n', '\t'], "�");
     let head = if title.is_empty() {
         String::new()
     } else {
@@ -160,4 +169,26 @@ pub fn show_patch(text: &str, plain: bool, page: bool) {
         }
     }
     out_raw(colorize(text).as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_neutralizes_controls_in_headers_and_symlink_targets() {
+        let patch = diff_text(
+            "name\x1b[2J\nspoof",
+            None,
+            Some(&Entry::Link("\x1b]52;c;payload\x07\u{009b}2J".into())),
+            "old\rlabel",
+            "new\x1b[2J",
+            "title\x07",
+        );
+        assert!(!patch
+            .chars()
+            .any(|ch| ch.is_control() && ch != '\n' && ch != '\t'));
+        assert!(!patch.contains("\nspoof"));
+        assert!(patch.contains("symlink ->"));
+    }
 }

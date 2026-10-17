@@ -1,6 +1,6 @@
 [package]
 name = "dotkit"
-version = "0.2.1"
+version = "0.3.0-dev"
 edition = "2021"
 rust-version = "1.88"
 description = "Your dotfiles and tools, the same on every machine: track them in git, sync and merge between machines, and put your shell on servers over ssh"
@@ -29,6 +29,7 @@ libc = "0.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29", "underline-color", "layout-cache"] }
 crossterm = "0.29.0"
 semver = "1"
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 
 [profile.release]
 opt-level = 3

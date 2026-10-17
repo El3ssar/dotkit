@@ -7,6 +7,7 @@ use crate::util::*;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 // --------------------------------------------------------------------------- init
@@ -227,7 +228,6 @@ pub fn cmd_add(a: &Args) {
         add_files(&files, a.flag("force"), a.flag("no_servers"));
     }
     if !tools.is_empty() {
-        crate::remote::ensure_mise();
         crate::pkg::add_tools(&tools, a);
     }
 }
@@ -338,6 +338,20 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
             .unwrap_or("")
             .to_string();
         let r#ref = spec.get("ref").and_then(Value::as_str).map(String::from);
+        if url.is_empty()
+            || url.starts_with('-')
+            || url.contains(['\n', '\r', '\t'])
+            || r#ref.as_ref().is_some_and(|r| {
+                r.is_empty() || r.starts_with('-') || r.chars().any(char::is_control)
+            })
+        {
+            fail(&format!("external ~/{rel}: invalid URL or ref"));
+            continue;
+        }
+        if let Err(e) = safe_home_directory(&rel) {
+            fail(&e);
+            continue;
+        }
         let dest = cx.home.join(&rel);
         if !dest.exists() {
             out.push((rel, url, r#ref, "missing"));
@@ -382,17 +396,10 @@ pub fn externals_state() -> Vec<(String, String, Option<String>, &'static str)> 
                     cmd.extend_from_slice(args);
                     run(&cmd, true)
                 };
-                let tag = g(&["describe", "--tags", "--exact-match", "HEAD"])
-                    .stdout
-                    .trim()
-                    .to_string();
                 let head = g(&["rev-parse", "HEAD"]).stdout.trim().to_string();
-                let branch = g(&["rev-parse", "--abbrev-ref", "HEAD"])
-                    .stdout
-                    .trim()
-                    .to_string();
-                let newer = g(&["merge-base", "--is-ancestor", r, "HEAD"]).code == 0;
-                if r != &tag && r != &branch && !head.starts_with(r.as_str()) && !newer {
+                let wanted = g(&["rev-parse", "--verify", &format!("{r}^{{commit}}")]);
+                let exact = wanted.code == 0 && wanted.stdout.trim() == head;
+                if !exact {
                     state = "stale";
                 }
             }
@@ -412,16 +419,18 @@ fn color_for(code: &str) -> &'static str {
 
 /// Tools kit itself needs on this machine, with how to get them.
 fn missing_tools() -> Vec<String> {
-    let cx = ctx();
     let mut out = Vec::new();
     if !have("git") {
         out.push("git (everything)".into());
     }
-    if cx.is_mac && !have("brew") {
-        out.push("brew (Mac tools: https://brew.sh)".into());
-    }
-    if !cx.is_mac && !have("mise") {
-        out.push("mise (Linux tools: curl https://mise.run | sh)".into());
+    if !have("brew")
+        && all_packages().iter().any(|(name, p)| {
+            crate::pkg::pkg_spec(p)
+                .is_some_and(|s| s.starts_with("brew:") || s.starts_with("cask:"))
+                && !crate::pkg::pkg_available(name, p)
+        })
+    {
+        out.push("brew (required by a missing tracked package: https://brew.sh)".into());
     }
     if crate::diff::delta_cmd().is_none() {
         out.push("delta (nicer diffs: kit sync installs it)".into());
@@ -430,9 +439,22 @@ fn missing_tools() -> Vec<String> {
 }
 
 /// Git paths waiting to be committed, without Git's quoting or directory collapsing.
-fn saved_changes() -> Vec<(String, String)> {
+pub(crate) fn saved_changes() -> Vec<(String, String)> {
     let status = git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-    let mut records = status.stdout.split('\0').filter(|s| !s.is_empty());
+    let mut changes = saved_changes_from_status(&status.stdout);
+    changes.extend(
+        hidden_by_gitignore()
+            .into_iter()
+            .map(|p| ("added".into(), format!("home/{p}"))),
+    );
+    changes.sort();
+    changes.dedup();
+    changes
+}
+
+/// Decode NUL-delimited Git porcelain without invoking Git or changing its index.
+pub(crate) fn saved_changes_from_status(text: &str) -> Vec<(String, String)> {
+    let mut records = text.split('\0').filter(|s| !s.is_empty());
     let mut changes = Vec::new();
     while let Some(record) = records.next() {
         if record.len() < 4 {
@@ -460,11 +482,6 @@ fn saved_changes() -> Vec<(String, String)> {
         };
         changes.push((action.into(), path.into()));
     }
-    changes.extend(
-        hidden_by_gitignore()
-            .into_iter()
-            .map(|p| ("added".into(), format!("home/{p}"))),
-    );
     changes.sort();
     changes.dedup();
     changes
@@ -693,6 +710,16 @@ pub fn cmd_status(a: &Args) {
         return;
     }
     let mut problems = !changes.is_empty();
+    for (name, p) in all_packages() {
+        for platform in ["mac", "linux"] {
+            if let Some(spec) = crate::pkg::s(&p, platform) {
+                if let Some(why) = crate::recipe::problem(spec) {
+                    problems = true;
+                    out(&format!("Unsupported recipe: {name} ({platform}): {why}. Use kit packages resolve --both or an explicit recipe."));
+                }
+            }
+        }
+    }
     let missing = missing_tools();
     if !missing.is_empty() {
         problems = true;
@@ -803,7 +830,7 @@ pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
             }
             "missing" | "repo" => continue, // nothing new here; the repo's version comes with kit sync
             "type" => {
-                warn(&format!("not saved ~/{rel}: a folder here, a file in the repo (kit rm ~/{rel}, then kit add ~/{rel})"));
+                fail(&format!("not saved ~/{rel}: a folder here, a file in the repo (kit rm ~/{rel}, then kit add ~/{rel})"));
                 continue;
             }
             "delete-conflict" if !force => {
@@ -827,7 +854,7 @@ pub fn re_add(prefixes: Option<&[String]>, force: bool) -> usize {
             _ => {}
         }
         if code != "deleted" && !rules_for(&rel, &local_contexts()).is_empty() {
-            warn(&format!("not saved ~/{rel}: it has {} rules, so edit the repo's copy (~/.local/share/kit/home)", cx.platform));
+            fail(&format!("not saved ~/{rel}: it has {} rules, so edit the repo's copy (~/.local/share/kit/home)", cx.platform));
             continue;
         }
         if code == "deleted" {
@@ -1014,6 +1041,9 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
             "{local} file(s) changed here aren't saved yet (kit save, or kit status to see them)"
         ));
     }
+    if !stuck.is_empty() {
+        set_exit(1);
+    }
     for (code, rel) in &stuck {
         let why = match *code {
             "conflict" => {
@@ -1050,15 +1080,27 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
 /// Write the repo's version here: files, then externals, packages and scripts.
 fn apply_all(run_new_scripts: bool) {
     let written = apply_files(None, false);
+    if exit_code() != 0 {
+        warn("setup skipped until file conflicts are resolved; use kit files to review them");
+        return;
+    }
     if !run_new_scripts {
         fail("setup is incomplete: repository code needs approval (kit sync --trust, or review in a terminal)");
         return;
     }
     apply_externals();
+    if exit_code() != 0 {
+        warn("package setup skipped after external checkout errors");
+        return;
+    }
     if ctx().is_mac {
         crate::pkg::install_packages();
     } else {
         crate::remote::linux_environment();
+    }
+    if exit_code() != 0 {
+        warn("repository hooks skipped after package setup errors");
+        return;
     }
     if run_new_scripts {
         run_scripts(None, false, false);
@@ -1365,12 +1407,17 @@ fn content_hash(data: &[u8]) -> String {
 fn queue_cloned_code() {
     let cx = ctx();
     let mut pending = serde_json::Map::new();
-    for (f, _, _) in script_status() {
+    for (f, meta, _) in script_status() {
+        if !meta.errors.is_empty() {
+            for error in meta.errors {
+                fail(&error);
+            }
+            continue;
+        }
         let name = format!("scripts/{}", f.file_name().unwrap().to_string_lossy());
-        pending.insert(
-            name,
-            Value::from(content_hash(&fs::read(f).unwrap_or_default())),
-        );
+        if let Ok(data) = crate::scripts::read_script(&f) {
+            pending.insert(name, Value::from(content_hash(&data)));
+        }
     }
     if !load_obj(&cx.externals).is_empty() {
         pending.insert(
@@ -1409,7 +1456,7 @@ fn review_pending_code(trust: bool) -> bool {
                     .map(|s| content_hash(s.as_bytes()))
             })
         } else {
-            fs::read(cx.source.join(name))
+            crate::scripts::read_script(&cx.source.join(name))
                 .ok()
                 .map(|b| content_hash(&b))
         };
@@ -1489,7 +1536,7 @@ fn pull() -> bool {
         .split('\0')
         .filter(|f| !f.is_empty())
         {
-            if let Ok(data) = fs::read(cx.source.join(f)) {
+            if let Ok(data) = crate::scripts::read_script(&cx.source.join(f)) {
                 pending.insert(f.into(), Value::from(content_hash(&data)));
             }
         }
@@ -1525,10 +1572,13 @@ pub fn cmd_sync(a: &Args) {
         die("no kit repo yet (kit init)");
     }
     guard_repo();
-    crate::remote::ensure_mise();
     commit_saved();
     let url = remote_url();
     let pulled = if url.is_empty() { true } else { pull() };
+    if !pulled {
+        fail("sync stopped: could not reconcile the backup repository; no setup actions run");
+        return;
+    }
     let allowed = if a.flag("trust") {
         review_pending_code(true)
     } else {
@@ -1551,15 +1601,45 @@ pub fn cmd_sync(a: &Args) {
             r.stderr.trim()
         ));
     }
-    say(&format!("backed up to {url}"));
+    if exit_code() == 0 {
+        say(&format!("backed up to {url}"));
+    } else {
+        warn(&format!(
+            "repository backed up to {url}; local setup is incomplete (errors above)"
+        ));
+    }
     warn_if_public(&url);
 }
 
 // --------------------------------------------------------------------------- undo
 fn files_under(base: &Path) -> Vec<std::path::PathBuf> {
+    fn empty_dirs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let entries: Vec<_> = entries.flatten().collect();
+        if entries.is_empty() {
+            out.push(dir.to_path_buf());
+        } else {
+            for entry in entries {
+                if is_real_dir(&entry.path()) {
+                    empty_dirs(&entry.path(), out);
+                }
+            }
+        }
+    }
     let mut rels = Vec::new();
     walk_entries(base, "", &mut rels, &mut |_, _| false);
-    rels.into_iter().map(|r| base.join(r)).collect()
+    let mut entries: Vec<_> = rels.into_iter().map(|r| base.join(r)).collect();
+    if let Ok(dirs) = fs::read_dir(base) {
+        for dir in dirs.flatten() {
+            if is_real_dir(&dir.path()) {
+                empty_dirs(&dir.path(), &mut entries);
+            }
+        }
+    }
+    entries.sort();
+    entries
 }
 
 fn backup_sets() -> Vec<String> {
@@ -1576,6 +1656,41 @@ fn backup_sets() -> Vec<String> {
 
 /// Put a backup set back (what a sync or undo replaced). Itself undoable.
 fn restore(stamp: &str) {
+    fn directory_modes(base: &Path, relative: &Path) -> KResult<()> {
+        let source = base.join(relative);
+        for entry in fs::read_dir(&source).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if !is_real_dir(&entry.path()) {
+                continue;
+            }
+            let rel = relative.join(entry.file_name());
+            directory_modes(base, &rel)?;
+            let destination = ctx().home.join(&rel);
+            if !is_real_dir(&destination) {
+                return Err(format!(
+                    "{} was not restored as a directory",
+                    destination.display()
+                ));
+            }
+            // Backup parents may have been generated for an individual file. They
+            // must never widen permissions on an existing private home directory.
+            let saved = entry
+                .metadata()
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode();
+            let current = fs::metadata(&destination)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode();
+            fs::set_permissions(
+                &destination,
+                fs::Permissions::from_mode(saved & current & 0o777),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
     let cx = ctx();
     let base = cx.backups.join(stamp);
     let now = now_stamp();
@@ -1598,7 +1713,24 @@ fn restore(stamp: &str) {
             if is_real_dir(&cx.home.join(&rel)) {
                 fs::remove_dir_all(cx.home.join(&rel)).map_err(|e| e.to_string())?;
             }
-            write_home(&rel, &e)
+            if matches!(e, Entry::Dir) {
+                let dest = cx.home.join(&rel);
+                if exists_or_link(&dest) {
+                    fs::remove_file(&dest).map_err(|e| e.to_string())?;
+                }
+                fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+                let permissions = fs::metadata(&p).map_err(|e| e.to_string())?.permissions();
+                fs::set_permissions(&dest, permissions).map_err(|e| e.to_string())
+            } else {
+                write_home(&rel, &e)?;
+                if let Entry::File(_, mode) = &e {
+                    // Recovery restores the snapshot's permissions, rather than
+                    // inheriting a replacement file's permissions as sync does.
+                    fs::set_permissions(cx.home.join(&rel), fs::Permissions::from_mode(*mode))
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
         })();
         match result {
             Ok(()) => out(&format!("  put back ~/{rel}")),
@@ -1607,6 +1739,10 @@ fn restore(stamp: &str) {
                 fail(&format!("could not put back ~/{rel}: {e}"));
             }
         }
+    }
+    if let Err(e) = directory_modes(&base, Path::new("")) {
+        failed = true;
+        fail(&format!("could not restore directory permissions: {e}"));
     }
     if !failed {
         let _ = fs::remove_dir_all(&base);
@@ -1656,6 +1792,16 @@ pub fn cmd_undo(a: &Args) {
 // --------------------------------------------------------------------------- externals
 pub fn apply_externals() {
     let home = &ctx().home;
+    let git_env = vec![
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+        (
+            "GIT_SSH_COMMAND".into(),
+            format!(
+                "{} -o BatchMode=yes",
+                std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".into())
+            ),
+        ),
+    ];
     for (rel, url, r#ref, st) in externals_state() {
         if st == "ok" {
             continue;
@@ -1682,21 +1828,32 @@ pub fn apply_externals() {
             args.push("--".into());
             args.push(url.clone());
             args.push(dest);
-            run(&args, false).code == 0
+            run_install(&format!("external-{rel}"), &args, None, Some(&git_env)).code == 0
         } else {
             let r = r#ref.clone().unwrap_or_default();
             say(&format!("updating ~/{rel} to {r}"));
-            let g = |extra: &[&str], capture: bool| {
+            let g = |extra: &[&str], _capture: bool| {
                 let mut cmd = vec!["git", "-c", "advice.detachedHead=false", "-C", &dest];
                 cmd.extend_from_slice(extra);
-                run(&cmd, capture).code == 0
+                query_full(&cmd, 120, None, Some(&git_env)).code == 0
+            };
+            let checkout = |revision: &str| {
+                // A changed pin must not silently abandon commits in a user's checkout.
+                if !g(&["diff", "--quiet"], true) || !g(&["diff", "--cached", "--quiet"], true) {
+                    fail(&format!("external ~/{rel}: local changes are present; left untouched (review it with git -C ~/{rel})"));
+                    return false;
+                }
+                if !g(&["merge-base", "--is-ancestor", "HEAD", revision], true) {
+                    fail(&format!("external ~/{rel}: requested ref {r} differs from this checkout and would abandon commits; left untouched (review it with git -C ~/{rel})"));
+                    return false;
+                }
+                g(&["merge", "--ff-only", "-q", revision], false)
             };
             let tagref = format!("refs/tags/{r}:refs/tags/{r}");
-            if g(&["fetch", "-q", "--depth", "1", "origin", &tagref], true) {
-                g(&["checkout", "-q", &r], false)
+            if g(&["fetch", "-q", "origin", &tagref], true) {
+                checkout(&r)
             } else {
-                g(&["fetch", "-q", "--depth", "1", "origin", &r], true)
-                    && g(&["checkout", "-q", "FETCH_HEAD"], false)
+                g(&["fetch", "-q", "origin", &r], true) && checkout("FETCH_HEAD")
             }
         };
         if !ok {

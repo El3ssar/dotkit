@@ -1,6 +1,6 @@
-//! packages.json: { name: {"mac": "brew:bat"|"cask:kitty"|"cargo:eza"|"cargo-git:<url>"|"cmd:<shell>"|"mise:<spec>",
+//! packages.json: { name: {"mac": "brew:bat"|"cask:kitty"|"cargo:eza"|"mise:<spec>",
 //!                         "linux": "aqua:sharkdp/bat@0.26.1"   (a mise tool spec, Linux machines + servers),
-//!                         "linux_fallback": "cargo:...@1.0"   (built from source when no download runs),
+//!                         "linux_fallback": "cargo:...@1.0.0"   (built from source when no download runs),
 //!                         "bin": "bat", "remote": false  (not sent to servers)} }
 use crate::cli::Args;
 use crate::util::*;
@@ -19,6 +19,8 @@ const NOT_MISE: &[&str] = &[
     "mise",
     "system",
     "builtin",
+    "missing",
+    "blocked",
 ]; // Mac-only recipe kinds
 
 /// kit's own tools: always installed with kit, even if packages.json doesn't list them
@@ -34,15 +36,23 @@ fn core_packages() -> BTreeMap<String, Pkg> {
     BTreeMap::from([
         (
             "delta".to_string(),
-            mk("brew:git-delta", "aqua:dandavison/delta@0.20.1", "delta"),
+            mk(
+                "aqua:dandavison/delta@0.20.1",
+                "aqua:dandavison/delta@0.20.1",
+                "delta",
+            ),
         ),
         (
             "bat".to_string(),
-            mk("brew:bat", "aqua:sharkdp/bat@0.26.1", "bat"),
+            mk("aqua:sharkdp/bat@0.26.1", "aqua:sharkdp/bat@0.26.1", "bat"),
         ),
         (
             "neovim".to_string(),
-            mk("brew:neovim", "aqua:neovim/neovim@0.12.6", "nvim"),
+            mk(
+                "aqua:neovim/neovim@0.12.6",
+                "aqua:neovim/neovim@0.12.6",
+                "nvim",
+            ),
         ),
     ])
 }
@@ -89,10 +99,16 @@ pub fn save_pkgs(p: &BTreeMap<String, Pkg>) {
 }
 
 pub fn all_packages() -> BTreeMap<String, Pkg> {
+    all_packages_for(ctx().platform)
+}
+
+/// Default-tool aliases must be resolved for the destination machine, which
+/// may use different binary names from the host that builds an SSH payload.
+pub(crate) fn all_packages_for(platform: &str) -> BTreeMap<String, Pkg> {
     let pkgs = load_pkgs();
     let bins: Vec<String> = pkgs
         .iter()
-        .map(|(n, p)| package_bin(n, p).to_string())
+        .map(|(n, p)| package_bin_for(n, p, platform).to_string())
         .collect();
     let mut all: BTreeMap<String, Pkg> = core_packages()
         .into_iter()
@@ -109,13 +125,7 @@ pub fn s<'a>(p: &'a Pkg, k: &str) -> Option<&'a str> {
 }
 
 pub fn pkg_spec(p: &Pkg) -> Option<&str> {
-    let spec = s(p, ctx().platform);
-    if ctx().is_mac && !have("brew") && spec.is_some_and(|s| s.starts_with("brew:")) {
-        if let Some(portable) = s(p, "linux").filter(|s| is_mise_spec(s) || *s == "builtin:fizsh") {
-            return Some(portable);
-        }
-    }
-    spec
+    s(p, ctx().platform)
 }
 
 fn sends_to_servers(p: &Pkg) -> bool {
@@ -158,7 +168,7 @@ pub(crate) fn brew_prefix() -> Option<PathBuf> {
     PREFIX
         .get_or_init(|| {
             let b = which("brew")?;
-            let result = run(&["brew", "--prefix"], true);
+            let result = query(&["brew", "--prefix"], 15);
             if result.code == 0 && !result.stdout.trim().is_empty() {
                 return Some(PathBuf::from(result.stdout.trim()));
             }
@@ -169,15 +179,8 @@ pub(crate) fn brew_prefix() -> Option<PathBuf> {
 }
 
 pub fn pkg_installed(name: &str, p: &Pkg) -> bool {
-    let spec = pkg_spec(p).unwrap_or("");
-    let installed = load_obj(&ctx().state.join("packages-installed.json"));
-    if installed
-        .get(name)
-        .and_then(Value::as_str)
-        .is_some_and(|old| old != spec)
-    {
-        return false;
-    }
+    // Availability wins over old provider/version bookkeeping. Sync never replaces
+    // a working external installation; explicit update manages version changes.
     pkg_present(name, p, true)
 }
 
@@ -209,6 +212,183 @@ pub(crate) fn package_bin_for<'a>(name: &'a str, p: &'a Pkg, platform: &str) -> 
     })
 }
 
+// One bounded offline provider inventory per command, never a persistent cache.
+// Executing an arbitrary tracked tool to inspect it would violate status and
+// dry-run's read-only contract; executable shim files alone prove nothing.
+static MISE_INVENTORY: OnceLock<std::sync::Mutex<Option<std::collections::BTreeSet<String>>>> =
+    OnceLock::new();
+fn clear_mise_inventory() {
+    if let Some(cache) = MISE_INVENTORY.get() {
+        *cache.lock().unwrap() = None;
+    }
+}
+fn installed_mise_keys() -> std::collections::BTreeSet<String> {
+    let cache = MISE_INVENTORY.get_or_init(Default::default);
+    let mut cache = cache.lock().unwrap();
+    if let Some(keys) = cache.as_ref() {
+        return keys.clone();
+    }
+    let kit = ctx().home.join(REMOTE_KIT);
+    let mise = kit.join("bin/mise");
+    let mut keys = std::collections::BTreeSet::new();
+    if is_executable(&mise) {
+        let env = vec![
+            ("MISE_DATA_DIR".into(), path_str(&kit.join("mise"))),
+            (
+                "MISE_GLOBAL_CONFIG_FILE".into(),
+                path_str(&kit.join("mise.toml")),
+            ),
+            ("MISE_CONFIG_DIR".into(), path_str(&kit.join("config/mise"))),
+            ("MISE_CACHE_DIR".into(), path_str(&kit.join("cache/mise"))),
+            ("MISE_STATE_DIR".into(), path_str(&kit.join("state/mise"))),
+            ("MISE_TRUSTED_CONFIG_PATHS".into(), path_str(&kit)),
+            ("MISE_OFFLINE".into(), "1".into()),
+            ("MISE_AUTO_INSTALL".into(), "0".into()),
+            ("MISE_NOT_FOUND_AUTO_INSTALL".into(), "0".into()),
+            ("MISE_DISABLE_HOOKS".into(), "1".into()),
+        ];
+        let result = query_full(
+            &[
+                mise.as_os_str(),
+                std::ffi::OsStr::new("ls"),
+                std::ffi::OsStr::new("--installed"),
+                std::ffi::OsStr::new("--json"),
+                std::ffi::OsStr::new("--offline"),
+            ],
+            3,
+            Some(&kit),
+            Some(&env),
+        );
+        if result.code == 0 {
+            if let Ok(Value::Object(tools)) = serde_json::from_str::<Value>(&result.stdout) {
+                for (key, versions) in tools {
+                    if versions.as_array().is_some_and(|versions| {
+                        versions.iter().any(|v| {
+                            v.get("installed").and_then(Value::as_bool) == Some(true)
+                                && v.get("active").and_then(Value::as_bool) == Some(true)
+                        })
+                    }) {
+                        keys.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    *cache = Some(keys.clone());
+    keys
+}
+fn passive_binary_available(name: &str, p: &Pkg) -> bool {
+    let bin = package_bin(name, p);
+    let shims = ctx().home.join(REMOTE_KIT).join("mise/shims");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let paths: Vec<PathBuf> = std::env::split_paths(&path)
+        .map(|d| d.join(bin))
+        .chain(std::env::var_os("CARGO_HOME").map(|h| PathBuf::from(h).join("bin").join(bin)))
+        .chain([
+            ctx().home.join(REMOTE_KIT).join("bin").join(bin),
+            shims.join(bin),
+            ctx().home.join(".cargo/bin").join(bin),
+        ])
+        .collect();
+    // A generated shim must not hide a working external installation.
+    if paths
+        .iter()
+        .any(|path| !path.starts_with(&shims) && is_executable(path))
+    {
+        return true;
+    }
+    if !paths
+        .iter()
+        .any(|path| path.starts_with(&shims) && is_executable(path))
+    {
+        return false;
+    }
+    let keys = installed_mise_keys();
+    let base = pkg_spec(p).map(|s| split_spec(s.strip_prefix("mise:").unwrap_or(s)).0);
+    [
+        Some(name.to_string()),
+        Some(bin.to_string()),
+        base.clone(),
+        base.map(|b| pkg_key(&b)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|key| keys.contains(&key))
+}
+
+/// Runtime validation is only for completed installs, never passive status,
+/// preview or TUI inventory. A stale executable mise shim is not proof that its
+/// configured tool can start.
+pub(crate) fn installed_tool_runs(name: &str, p: &Pkg) -> bool {
+    if pkg_spec(p).is_some_and(|s| s.starts_with("cask:") || s.starts_with("builtin:")) {
+        return true;
+    }
+    let Some(path) = which(package_bin(name, p)) else {
+        return false;
+    };
+    if !path.starts_with(ctx().home.join(REMOTE_KIT).join("mise/shims")) {
+        return true;
+    }
+    // A mise shim resolves tools through its environment, not its filesystem
+    // location. Match the installation's private roots on a cold account that
+    // has not sourced Kit's shell activation yet.
+    let kit = ctx().home.join(REMOTE_KIT);
+    let env = vec![
+        ("MISE_DATA_DIR".into(), path_str(&kit.join("mise"))),
+        (
+            "MISE_GLOBAL_CONFIG_FILE".into(),
+            path_str(&kit.join("mise.toml")),
+        ),
+        ("MISE_CONFIG_DIR".into(), path_str(&kit.join("config/mise"))),
+        ("MISE_CACHE_DIR".into(), path_str(&kit.join("cache/mise"))),
+        ("MISE_STATE_DIR".into(), path_str(&kit.join("state/mise"))),
+        ("MISE_TRUSTED_CONFIG_PATHS".into(), path_str(&kit)),
+        ("MISE_AUTO_INSTALL".into(), "0".into()),
+        ("MISE_OFFLINE".into(), "1".into()),
+    ];
+    for flag in ["--version", "--help", "-h"] {
+        let r = query_full(
+            &[path.as_os_str(), std::ffi::OsStr::new(flag)],
+            5,
+            Some(&kit),
+            Some(&env),
+        );
+        let text = format!("{}{}", r.stdout, r.stderr);
+        if [
+            "No version is set",
+            "mise ERROR",
+            "GLIBC_",
+            "GLIBCXX",
+            "Exec format",
+            "cannot execute",
+        ]
+        .iter()
+        .any(|message| text.contains(message))
+        {
+            return false;
+        }
+        if r.code == 0 {
+            return true;
+        }
+        let lower = text.to_ascii_lowercase();
+        if !matches!(r.code, 1 | 2)
+            || ![
+                "unknown option",
+                "unknown flag",
+                "unrecognized option",
+                "unrecognized argument",
+                "invalid option",
+                "unexpected argument",
+            ]
+            .iter()
+            .any(|message| lower.contains(message))
+        {
+            return false;
+        }
+    }
+    false
+}
+
 fn pkg_present(name: &str, p: &Pkg, any_provider: bool) -> bool {
     let spec = pkg_spec(p).unwrap_or("");
     let (kind, what) = spec.split_once(':').unwrap_or((spec, ""));
@@ -216,7 +396,7 @@ fn pkg_present(name: &str, p: &Pkg, any_provider: bool) -> bool {
         return is_executable(&ctx().home.join(REMOTE_KIT).join("opt/fizsh/bin/fizsh"));
     }
     let bin = package_bin(name, p);
-    if kind != "cask" && any_provider && have(bin) {
+    if kind != "cask" && any_provider && passive_binary_available(name, p) {
         return true;
     }
     let what = what.rsplit('/').next().unwrap_or(what); // tap/name -> name
@@ -242,16 +422,48 @@ fn pkg_present(name: &str, p: &Pkg, any_provider: bool) -> bool {
         let kit = ctx().home.join(REMOTE_KIT);
         if ["mise/shims", "bin", "opt/nvim/bin", "opt/zsh/bin"]
             .iter()
-            .any(|d| is_executable(&kit.join(d).join(bin)))
+            .any(|d| *d != "mise/shims" && is_executable(&kit.join(d).join(bin)))
         {
             return true;
         }
     }
-    have(bin)
+    passive_binary_available(name, p)
 }
 
 pub fn install_package(name: &str, p: &Pkg) -> bool {
     let Some(spec) = pkg_spec(p) else { return true };
+    if let Some(problem) = crate::recipe::problem(spec) {
+        fail(&format!("{name}: unsupported recipe {spec:?}: {problem}; replace it with kit add {name} --{} <mise-or-cargo-recipe>", ctx().platform));
+        return false;
+    }
+    // Legacy Kit-owned recipes are not mise backend identifiers. Keep the
+    // local path consistent with setup.sh rather than sending builtin:* to
+    // `mise use`, which can never resolve it.
+    if spec == "builtin:mise" {
+        crate::remote::ensure_mise();
+        record_install(name, spec);
+        return true;
+    }
+    if spec == "builtin:nvim" {
+        let mut translated = p.clone();
+        translated.insert(ctx().platform.into(), "aqua:neovim/neovim@0.12.6".into());
+        return install_package(name, &translated);
+    }
+    if spec == "builtin:zsh" {
+        if have("zsh") {
+            record_install(name, spec);
+            return true;
+        }
+        fail(&format!("{name}: zsh is unavailable; Linux setup provisions Kit's portable shell, while macOS requires its system zsh"));
+        return false;
+    }
+    if !spec.starts_with("cargo:")
+        && !spec.starts_with("builtin:")
+        && !spec.starts_with("brew:")
+        && !spec.starts_with("cask:")
+    {
+        crate::remote::ensure_mise();
+    }
     let (kind, what) = spec.split_once(':').unwrap_or((spec, ""));
     let cmd: Vec<String> = match kind {
         "builtin" if what == "fizsh" => {
@@ -264,27 +476,34 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
             .unwrap_or_else(|e| die(&format!("cannot prepare fizsh installer: {e}")));
             vec!["bash".into(), path_str(&script)]
         }
-        "brew" => vec!["brew".into(), "install".into(), what.into()],
+        "brew" => vec![
+            "brew".into(),
+            "install".into(),
+            "--formula".into(),
+            what.into(),
+        ],
+        "cask" if !ctx().is_mac => {
+            fail(&format!(
+                "{name}: Homebrew casks are macOS-only; set an explicit Linux recipe"
+            ));
+            return false;
+        }
         "cask" => vec![
             "brew".into(),
             "install".into(),
             "--cask".into(),
             what.into(),
         ],
+        "cargo" if !have("cargo") => {
+            crate::remote::ensure_mise();
+            vec!["mise".into(), "use".into(), "-g".into(), spec.into()]
+        }
         "cargo" => vec![
             "cargo".into(),
             "install".into(),
             "--locked".into(),
             what.into(),
         ],
-        "cargo-git" => vec![
-            "cargo".into(),
-            "install".into(),
-            "--locked".into(),
-            "--git".into(),
-            what.into(),
-        ],
-        "cmd" => vec!["sh".into(), "-c".into(), what.into()],
         "mise" => vec!["mise".into(), "use".into(), "-g".into(), what.into()],
         _ => vec!["mise".into(), "use".into(), "-g".into(), spec.into()],
     };
@@ -296,7 +515,7 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
         return false;
     }
     say(&format!("installing {name} ({spec})"));
-    let env = if cmd[0] == "mise" {
+    let mut env = if cmd[0] == "mise" {
         let kit = ctx().home.join(REMOTE_KIT);
         vec![
             (
@@ -311,24 +530,29 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
     } else {
         vec![]
     };
+    env.extend([
+        ("HOMEBREW_NO_AUTO_UPDATE".into(), "1".into()),
+        ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+    ]);
     if cmd[0] == "mise" {
         let target = cmd.last().unwrap();
-        let dependency = if target.starts_with("cargo:") {
-            Some("core:rust@stable")
+        let dependencies: &[&str] = if target.starts_with("cargo:") {
+            &["core:rust@stable"]
         } else if target.starts_with("npm:") {
-            Some("core:node@lts")
+            &["core:node@lts"]
         } else if target.starts_with("go:") {
-            Some("core:go@latest")
+            &["core:go@latest"]
+        } else if target.starts_with("pypi:") {
+            &["aqua:astral-sh/uv@latest", "core:python@3.12"]
         } else {
-            None
+            &[]
         };
-        if let Some(dep) = dependency {
-            if run_full(
-                &["mise", "use", "-g", dep],
-                false,
+        for dep in dependencies {
+            if run_install(
+                name,
+                &["mise", "use", "-g", *dep],
                 Some(&ctx().home),
                 Some(&env),
-                None,
             )
             .code
                 != 0
@@ -339,8 +563,13 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
         }
         crate::remote::install_activation();
     }
-    if run_full(&cmd, false, Some(&ctx().home), Some(&env), None).code != 0 {
+    if run_install(name, &cmd, Some(&ctx().home), Some(&env)).code != 0 {
         fail(&format!("{name}: install failed"));
+        return false;
+    }
+    clear_mise_inventory();
+    if !pkg_available(name, p) || !installed_tool_runs(name, p) {
+        fail(&format!("{name}: installer exited successfully but the expected tool is unavailable; check --bin and the install log"));
         return false;
     }
     record_install(name, spec);
@@ -348,6 +577,7 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
 }
 
 pub(crate) fn record_install(name: &str, spec: &str) {
+    clear_mise_inventory();
     let path = ctx().state.join("packages-installed.json");
     let mut installed = load_obj(&path);
     installed.insert(name.into(), spec.into());
@@ -356,10 +586,32 @@ pub(crate) fn record_install(name: &str, spec: &str) {
 
 pub fn install_packages() {
     for (n, p) in all_packages() {
-        if pkg_spec(&p).is_some() && !pkg_installed(&n, &p) {
+        if pkg_spec(&p).is_none() {
+            if !ctx().is_mac && s(&p, "mac").is_some_and(|s| s.starts_with("cask:")) {
+                continue;
+            }
+            if !pkg_installed(&n, &p) {
+                fail(&format!("{n}: no {} recipe and the tool is not installed here; kit add {n} --{} <recipe>", ctx().platform, ctx().platform));
+            }
+        } else if !pkg_installed(&n, &p) {
             install_package(&n, &p);
         }
     }
+}
+
+fn mise_query(args: &[&str]) -> Out {
+    let kit = ctx().home.join(REMOTE_KIT);
+    let env = vec![
+        (
+            "MISE_GLOBAL_CONFIG_FILE".into(),
+            path_str(&kit.join("mise.toml")),
+        ),
+        ("MISE_CONFIG_DIR".into(), path_str(&kit.join("config/mise"))),
+        ("MISE_DATA_DIR".into(), path_str(&kit.join("mise"))),
+    ];
+    let mut cmd = vec!["mise"];
+    cmd.extend_from_slice(args);
+    query_full(&cmd, 30, Some(&ctx().home), Some(&env))
 }
 
 fn registry_entry(name: &str) -> Option<Value> {
@@ -368,7 +620,7 @@ fn registry_entry(name: &str) -> Option<Value> {
         if !have("mise") {
             return vec![];
         }
-        let r = run(&["mise", "registry", "--json"], true);
+        let r = mise_query(&["registry", "--json"]);
         serde_json::from_str::<Vec<Value>>(&r.stdout).unwrap_or_default()
     });
     let (name, _) = split_spec(name);
@@ -413,14 +665,16 @@ pub fn resolve_tools(names: &[String]) {
             p.insert("linux".into(), "builtin:fizsh".into());
             changed = true;
         }
-        if s(p, "linux").is_some() {
+        if s(p, "linux").is_some_and(|s| crate::recipe::problem(s).is_none()) {
             note(&format!(
                 "{name}: Linux recipe already set; kept existing recipe"
             ));
             continue;
         }
         let Some(mac) = s(p, "mac").map(String::from) else {
-            fail(&format!("{name}: cannot resolve a Linux recipe without a macOS recipe; kit add {name} --linux <recipe>"));
+            fail(&format!(
+                "{name}: no supported source recipe; kit add {name} --linux <recipe>"
+            ));
             continue;
         };
         if let Some(recipe) = portable_recipe(name, &mac) {
@@ -429,7 +683,19 @@ pub fn resolve_tools(names: &[String]) {
                     p.insert("bin".into(), bin.into());
                 }
             }
-            p.insert("linux".into(), pinned(&recipe).into());
+            let recipe = pinned(&recipe);
+            if let Some(why) = crate::recipe::problem(&recipe) {
+                fail(&format!(
+                    "{name}: could not resolve a supported Linux recipe: {why}"
+                ));
+                continue;
+            }
+            let mut candidate = Pkg::new();
+            candidate.insert("linux".into(), recipe.clone().into());
+            if !crate::capability::check_entry(name, &candidate, false) {
+                continue;
+            }
+            p.insert("linux".into(), recipe.into());
             changed = true;
             note(&format!("{name}: added Linux recipe"));
         } else {
@@ -441,50 +707,68 @@ pub fn resolve_tools(names: &[String]) {
     }
 }
 
-fn portable_recipe(name: &str, mac: &str) -> Option<String> {
-    match mac.split_once(':') {
-        Some(("cargo", what)) => Some(format!("cargo:{what}")),
-        Some(("cargo-git", url)) => Some(format!("cargo:{url}")),
-        Some(("cmd", command)) if name == "rustup" && command.contains("https://sh.rustup.rs") => {
-            Some("core:rust@stable".into())
+/// Explicit migration only; never rewrite a valid platform recipe during sync.
+pub fn resolve_mac_tools(names: &[String]) {
+    let mut pkgs = load_pkgs();
+    let mut changed = false;
+    for (name, p) in &mut pkgs {
+        if !names.is_empty() && !names.contains(name) {
+            continue;
         }
-        Some(("cmd", command))
-            if ![
-                "brew ",
-                "osascript",
-                "/Applications/",
-                "pbcopy",
-                "launchctl",
-                "defaults write",
-            ]
-            .iter()
-            .any(|token| command.contains(token)) =>
-        {
-            Some(mac.into())
+        if s(p, "mac").is_some_and(|s| crate::recipe::problem(s).is_none()) {
+            continue;
         }
-        Some(("cask", "gcloud-cli" | "google-cloud-sdk")) => mise_backend("gcloud"),
-        Some(("cask" | "brew", "kitty")) => Some("system:kitty".into()),
-        Some(("mise", what)) => Some(what.into()),
-        Some(("brew", what)) => match what {
-            "fizsh" => Some("builtin:fizsh".into()),
-            "zsh" => Some("builtin:zsh".into()),
-            "neovim" => Some("builtin:nvim".into()),
-            "mise" => Some("builtin:mise".into()),
-            "coreutils" | "graphviz" | "pkgconf" | "cbonsai" => Some(format!("system:{what}")),
-            "sevenzip" => Some("aqua:ip7z/7zip".into()),
-            "fnm" => Some("aqua:Schniz/fnm".into()),
-            _ => mise_backend(what).or_else(|| mise_backend(name)),
-        },
-        _ => None,
+        let source = s(p, "linux")
+            .filter(|s| crate::recipe::problem(s).is_none())
+            .map(String::from)
+            .or_else(|| mise_backend(name).map(|s| pinned(&s)));
+        let Some(source) = source else {
+            fail(&format!("{name}: no supported macOS recipe"));
+            continue;
+        };
+        if let Some(why) = crate::recipe::problem(&source) {
+            fail(&format!("{name}: {why}"));
+            continue;
+        }
+        let mut candidate = Pkg::new();
+        candidate.insert("mac".into(), source.clone().into());
+        if !crate::capability::check_entry(name, &candidate, false) {
+            continue;
+        }
+        p.insert("mac".into(), source.into());
+        changed = true;
+        note(&format!(
+            "{name}: added macOS recipe; kit packages check {name} checks artifact coverage"
+        ));
     }
+    if changed {
+        save_pkgs(&pkgs);
+    }
+}
+
+fn portable_recipe(name: &str, mac: &str) -> Option<String> {
+    if let Some(spec) = mac.strip_prefix("mise:") {
+        return Some(spec.into());
+    }
+    if crate::recipe::backend_supported(mac) {
+        return Some(mac.into());
+    }
+    if name == "fizsh" {
+        return Some("builtin:fizsh".into());
+    }
+    // Migration is explicit: consult mise, never translate to apt/Brew/custom commands.
+    mise_backend(name)
 }
 
 fn mise_backend(name: &str) -> Option<String> {
     if name == "fizsh" {
         return Some("builtin:fizsh".into());
     }
+    if let Some(spec) = name.strip_prefix("mise:") {
+        return crate::recipe::backend_supported(spec).then(|| spec.to_string());
+    }
     if name.contains(':') {
-        return is_mise_spec(name).then(|| name.to_string());
+        return crate::recipe::backend_supported(name).then(|| name.to_string());
     }
     if Regex::new(r"^[\w.-]+/[\w.-]+$").unwrap().is_match(name) {
         return Some(format!("github:{name}"));
@@ -502,13 +786,17 @@ fn mise_backend(name: &str) -> Option<String> {
                     return Some(b.into());
                 }
             }
-            return bs.first().and_then(Value::as_str).map(String::from);
+            return bs
+                .iter()
+                .filter_map(Value::as_str)
+                .find(|b| crate::recipe::backend_supported(b))
+                .map(String::from);
         }
     }
     if !have("mise") {
         return None;
     }
-    let r = run(&["mise", "registry", name], true);
+    let r = mise_query(&["registry", name]);
     let words: Vec<&str> = r.stdout.split_whitespace().collect();
     if r.code != 0 || words.is_empty() {
         return None;
@@ -523,14 +811,17 @@ fn mise_backend(name: &str) -> Option<String> {
             return Some(b.to_string());
         }
     }
-    backends.first().map(|b| b.to_string())
+    backends
+        .into_iter()
+        .find(|b| crate::recipe::backend_supported(b))
+        .map(String::from)
 }
 
-fn brew_formula(name: &str) -> Option<String> {
+pub(crate) fn brew_formula(name: &str) -> Option<String> {
     if !have("brew") || name.contains('/') || name.contains(':') {
         return None;
     }
-    let r = run(&["brew", "info", "--json=v2", name], true);
+    let r = query(&["brew", "info", "--json=v2", name], 30);
     if r.code != 0 {
         return None;
     }
@@ -556,7 +847,7 @@ pub(crate) fn mise_latest(backend: &str) -> Option<String> {
     if !have("mise") {
         return None;
     }
-    let r = run(&["mise", "latest", backend], true);
+    let r = mise_query(&["latest", backend]);
     let v = r.stdout.trim().to_string();
     (r.code == 0 && !v.is_empty() && !v.contains(char::is_whitespace)).then_some(v)
 }
@@ -576,199 +867,164 @@ fn describe(name: &str, p: &Pkg) -> String {
 }
 
 fn pinned(spec: &str) -> String {
-    if spec.starts_with("system:") || spec.starts_with("builtin:") || spec.starts_with("cmd:") {
+    if spec.starts_with("brew:")
+        || spec.starts_with("cask:")
+        || spec.starts_with("system:")
+        || spec.starts_with("builtin:")
+        || spec.starts_with("cmd:")
+    {
         return spec.into();
     }
     let (base, ver) = split_spec(spec);
     let ver = ver
+        .filter(|v| !matches!(v.as_str(), "latest" | "stable" | "lts"))
         .or_else(|| mise_latest(&base))
         .unwrap_or_else(|| "latest".into());
     format!("{base}@{ver}")
 }
 
-/// The same recipe at the newest version mise knows (or unchanged when it can't tell).
-fn bumped(spec: &str) -> String {
-    if spec.starts_with("system:") || spec.starts_with("builtin:") || spec.starts_with("cmd:") {
-        return spec.into();
-    }
-    let (base, old) = split_spec(spec);
-    match mise_latest(&base) {
-        Some(v) => format!("{base}@{v}"),
-        None => old
-            .map(|o| format!("{base}@{o}"))
-            .unwrap_or_else(|| format!("{base}@latest")),
-    }
-}
-
-/// `kit add <tool>`: work out how to install it on a Mac and on Linux, record it, install it here.
+/// Record explicit recipes or resolve a bare name through Cargo ownership / mise.
 pub fn add_tools(names: &[String], a: &Args) {
     if a.flag("upgrade") {
         crate::updates::update_tools(names, false);
         return;
     }
     let mut pkgs = load_pkgs();
-    let mut changed = false;
+    let valid_name = Regex::new(r"^[A-Za-z0-9_.+-]+$").unwrap();
     for name in names {
-        if let Some(spec) = a.one("linux").filter(|s| {
-            !is_mise_spec(s)
-                && !s.starts_with("cmd:")
-                && !s.starts_with("system:")
-                && !s.starts_with("builtin:")
-        }) {
-            fail(&format!("{spec} isn't a Linux recipe"));
+        let key = pkg_key(name);
+        if !valid_name.is_match(&key) || key.starts_with('-') {
+            fail(&format!("invalid package name: {name:?}"));
             continue;
         }
-        if let Some(spec) = a.one("fallback").filter(|s| !is_mise_spec(s)) {
-            fail(&format!("--fallback {spec}: use a mise spec"));
-            continue;
-        }
-        let name = name.clone();
-        let key = pkg_key(&name);
         let old = pkgs.get(&key).cloned();
-        let mut adopted_cargo = None;
         let mut entry = old.clone().unwrap_or_default();
-        let kind = name.split_once(':').map(|(k, _)| k.to_string());
-        // how to install it on a Mac
-        if let Some(m) = a.one("mac") {
-            entry.insert("mac".into(), m.into());
-        } else if matches!(
-            kind.as_deref(),
-            Some("brew" | "cask" | "cargo" | "cargo-git" | "cmd")
-        ) {
-            entry.insert("mac".into(), name.clone().into()); // e.g. kit add cask:kitty
-        }
-        // Migrate the former fizsh placeholder rather than reusing its zsh recipe.
-        if key == "fizsh" && s(&entry, "linux") == Some("builtin:zsh") {
-            entry.insert("linux".into(), "builtin:fizsh".into());
-        }
-        // how to install it on Linux and servers (adding a tracked tool again pins the latest version)
+        let explicit = a.one("mac").is_some() || a.one("linux").is_some();
+        let named_spec = name.contains(':');
+        if named_spec
+            && !crate::recipe::backend_supported(name)
+            && !name.starts_with("brew:")
+            && !name.starts_with("cask:")
+            && name != "builtin:fizsh"
         {
-            let wanted = a
-                .one("linux")
-                .or_else(|| (kind.is_some() && is_mise_spec(&name)).then(|| name.clone()));
-            match wanted {
-                Some(spec) if is_mise_spec(&spec) || spec.starts_with("system:") || spec.starts_with("builtin:") || spec.starts_with("cmd:") => {
-                    entry.insert("linux".into(), pinned(&spec).into());
+            fail(&format!(
+                "{name}: use a supported mise, Cargo or Homebrew source"
+            ));
+            continue;
+        }
+        if [a.one("mac"), a.one("linux"), a.one("fallback")]
+            .iter()
+            .flatten()
+            .any(|s| {
+                !crate::recipe::backend_supported(s)
+                    && !s.starts_with("brew:")
+                    && !s.starts_with("cask:")
+                    && s != "builtin:fizsh"
+            })
+        {
+            fail(&format!("{name}: use a supported mise, Cargo or Homebrew recipe; system packages and custom install commands are not managed"));
+            continue;
+        }
+        let adopted = if !named_spec && !explicit {
+            crate::updates::installed_cargo_spec(package_bin(&key, &entry))
+        } else {
+            None
+        };
+        let resolved = if old.is_some() && !named_spec {
+            None
+        } else if let Some(spec) = adopted.clone() {
+            Some(spec)
+        } else if name.starts_with("brew:") || name.starts_with("cask:") {
+            Some(name.clone())
+        } else {
+            crate::remote::ensure_mise();
+            mise_backend(name)
+                .map(|s| pinned(&s))
+                .or_else(|| brew_formula(name))
+        };
+        if let Some(spec) = resolved {
+            if named_spec {
+                entry.insert("mac".into(), spec.clone().into());
+                if !spec.starts_with("cask:") {
+                    entry.insert("linux".into(), spec.into());
                 }
-                Some(spec) => fail(&format!("{spec} isn't a Linux recipe (use a mise spec like aqua:owner/repo or github:owner/repo)")),
-                None => match s(&entry, "linux").map(String::from) {
-                    Some(cur) => {
-                        entry.insert("linux".into(), bumped(&cur).into());
-                    }
-                    None => {
-                        if let Some(b) = mise_backend(&name) {
-                            entry.insert("linux".into(), pinned(&b).into());
-                        }
-                    }
-                },
-            }
-            if a.one("fallback").is_none() {
-                if let Some(fb) = s(&entry, "linux_fallback").map(String::from) {
-                    if old.is_some() {
-                        entry.insert("linux_fallback".into(), bumped(&fb).into());
-                    }
+            } else {
+                entry.entry("mac").or_insert_with(|| spec.clone().into());
+                if !spec.starts_with("cask:") {
+                    entry.entry("linux").or_insert_with(|| spec.into());
                 }
             }
         }
-        if a.one("mac").is_none() {
-            if let Some(old) = &old {
-                if s(old, "linux")
-                    .is_some_and(|linux| s(old, "mac") == Some(format!("mise:{linux}").as_str()))
-                {
-                    if let Some(linux) = s(&entry, "linux").map(String::from) {
-                        entry.insert("mac".into(), format!("mise:{linux}").into());
-                    }
+        for (field, wanted) in [
+            ("mac", a.one("mac")),
+            ("linux", a.one("linux")),
+            ("linux_fallback", a.one("fallback")),
+        ] {
+            if let Some(spec) = wanted {
+                if crate::recipe::backend_supported(&spec) {
+                    crate::remote::ensure_mise();
                 }
+                entry.insert(field.into(), pinned(&spec).into());
             }
         }
-        if s(&entry, "mac").is_none() {
-            let mac = brew_formula(&name).or_else(|| {
-                s(&entry, "linux").map(|l| {
-                    if l == "builtin:fizsh" {
-                        l.to_string()
-                    } else {
-                        format!("mise:{l}")
-                    }
-                })
-            });
-            if let Some(m) = mac {
-                entry.insert("mac".into(), m.into());
-            }
+        if let Some(spec) = adopted {
+            entry.insert(ctx().platform.into(), spec.into());
         }
-        if s(&entry, "linux").is_none() {
-            if let Some(recipe) = s(&entry, "mac").and_then(|mac| portable_recipe(&key, mac)) {
-                entry.insert("linux".into(), pinned(&recipe).into());
-            }
+        if let Some(bin) = a.one("bin") {
+            entry.insert("bin".into(), bin.into());
         }
         if s(&entry, "bin").is_none() {
             if let Some(bin) = s(&entry, "linux").and_then(|spec| inferred_bin(&key, spec)) {
                 entry.insert("bin".into(), bin.into());
             }
         }
-        if let Some(b) = a.one("bin") {
-            entry.insert("bin".into(), b.into());
-        }
-        let platform_arg = if ctx().is_mac { "mac" } else { "linux" };
-        if kind.is_none() && a.one(platform_arg).is_none() {
-            if let Some(spec) =
-                crate::updates::installed_cargo_spec(package_bin_for(&key, &entry, ctx().platform))
-            {
-                entry.insert(ctx().platform.into(), spec.clone().into());
-                adopted_cargo = Some(spec);
-            }
-        }
-        if let Some(fb) = a.one("fallback") {
-            if is_mise_spec(&fb) {
-                entry.insert("linux_fallback".into(), pinned(&fb).into());
-            } else {
-                fail(&format!(
-                    "--fallback {fb}: use a mise spec, e.g. cargo:<crate>@<version>"
-                ));
-            }
-        }
         if a.flag("no_servers") {
             entry.insert("remote".into(), false.into());
         }
-        if a.flag("servers") {
-            entry.remove("remote");
-        }
-        entry.retain(|_, v| !v.is_null() && v.as_str() != Some(""));
         if s(&entry, "mac").is_none() && s(&entry, "linux").is_none() {
-            fail(&format!("{name}: not a file here, and not a tool Homebrew or mise knows — for a tool give its GitHub repo (owner/repo) or --mac/--linux"));
+            fail(&format!("{name}: mise could not resolve a recipe; use an explicit pinned mise/Cargo recipe or owner/repo release source"));
             continue;
         }
-        if Some(&entry) == old.as_ref() {
-            out(&format!(
-                "  already tracked, nothing new: {}",
-                describe(&key, &entry)
+        if s(&entry, "linux_fallback").is_some_and(|s| !crate::recipe::backend_supported(s)) {
+            fail(&format!(
+                "{key}: Linux fallback must use a mise backend or Cargo source"
             ));
-        } else {
+            continue;
+        }
+        let mut invalid = false;
+        for field in ["mac", "linux", "linux_fallback"] {
+            if let Some(spec) = s(&entry, field) {
+                if let Some(why) = crate::recipe::problem(spec) {
+                    fail(&format!("{key} ({field}): {why}"));
+                    invalid = true;
+                }
+            }
+        }
+        if invalid {
+            continue;
+        }
+        if old.as_ref() != Some(&entry) {
+            if !crate::capability::check_entry(&key, &entry, false) {
+                continue;
+            }
             pkgs.insert(key.clone(), entry.clone());
             save_pkgs(&pkgs);
-            changed = true;
-            out(&format!(
-                "  {} {}",
+            say(&format!(
+                "{} {}",
                 if old.is_some() { "updated" } else { "added" },
                 describe(&key, &entry)
             ));
-        }
-        if let Some(spec) = adopted_cargo {
-            record_install(&key, &spec);
+        } else {
+            note(&format!(
+                "{key}: already tracked; use kit packages update for upgrades"
+            ));
         }
         if ctx().is_mac && pkg_spec(&entry).is_some() && !pkg_installed(&key, &entry) {
             install_package(&key, &entry);
         }
     }
-    if !ctx().is_mac
-        && names.iter().any(|n| {
-            pkgs.get(&pkg_key(n))
-                .is_some_and(|p| s(p, "linux").is_some())
-        })
-    {
+    if !ctx().is_mac && exit_code() == 0 {
         crate::remote::linux_environment();
-    }
-    if changed {
-        say("kit sync to back it up");
     }
 }
 
