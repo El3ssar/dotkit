@@ -298,6 +298,31 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(git(checkout, 'rev-parse', 'HEAD'), local)
         self.assertEqual((checkout/'local').read_text(), 'mine\n')
 
+    def test_gcloud_descriptors_are_pinned_for_all_supported_targets(self):
+        fakebin=self.root/'fakebin'; fakebin.mkdir()
+        uname=fakebin/'uname'
+        self.env['PATH']=str(fakebin)+os.pathsep+os.environ['PATH']
+        expected={('Linux','x86_64'):'linux-x86_64', ('Linux','aarch64'):'linux-arm',
+                  ('Darwin','x86_64'):'darwin-x86_64', ('Darwin','arm64'):'darwin-arm'}
+        for (system,arch),platform in expected.items():
+            uname.write_text(f'#!/bin/sh\ncase "$1" in -s) echo {system};; -m) echo {arch};; esac\n'); uname.chmod(0o755)
+            r=self.run_script('install-gcloud.sh','589.0.0','--describe')
+            url,digest=r.stdout.strip().split('\t')
+            self.assertEqual(url, f'https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-589.0.0-{platform}.tar.gz')
+            self.assertEqual(len(digest),64)
+            self.assertTrue(all(c in '0123456789abcdef' for c in digest))
+        self.assertFalse((self.kit/'opt').exists())
+
+    def test_gcloud_bad_checksum_preserves_existing_installation(self):
+        fakebin=self.root/'fakebin'; fakebin.mkdir()
+        curl=fakebin/'curl'; curl.write_text('#!/bin/sh\nwhile [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; printf corrupt > "$1"; exit; fi; shift; done\n'); curl.chmod(0o755)
+        self.env['PATH']=str(fakebin)+os.pathsep+os.environ['PATH']
+        old=self.kit/'opt/gcloud'; old.mkdir(parents=True); (old/'original').write_text('keep')
+        r=self.run_script('install-gcloud.sh','589.0.0',expected=1)
+        self.assertIn('checksum mismatch',r.stderr)
+        self.assertEqual((old/'original').read_text(),'keep')
+        self.assertEqual(list((self.kit/'opt').iterdir()),[old])
+
     def test_external_clone_is_bounded_and_noninteractive(self):
         self.setup_package_fixture()
         fakebin = self.root/'fakebin'; fakebin.mkdir()

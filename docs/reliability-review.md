@@ -111,3 +111,17 @@ groups recipe diagnostics and leaves detailed reasons in `status -v`, while reta
 unsynced file/package details. External checkouts ahead of or diverged from a pin no longer
 suggest that ordinary sync can downgrade them. Unsupported sources remain visible and
 require a verified replacement; no arbitrary command/plugin is re-enabled.
+
+## 0.3.2 portable recipe and external pin correction
+
+- Gcloud has a narrow bundled recipe for 589.0.0, with pinned SHA-256 hashes of Google's
+  versioned archives for macOS/Linux Intel/ARM and private Python 3.14.8. The archives'
+  embedded VERSION and digests were checked directly; their packaging differs from Google's
+  unversioned latest downloads. No arbitrary plugin/custom command is enabled.
+- Rust core recipes validate version, availability, official URLs and hashes through the
+  official Rust release manifest instead of relying on missing mise lock entries. Linux
+  coverage refers to Rust's GNU targets, not universal libc compatibility.
+- Exact full Git commit pins now clone correctly into new machines through shared local/SSH
+  clone logic. Failed clones leave no partial checkout. Existing checkout protection remains.
+- The gcloud cold-install test uses a temporary HOME and private tools, runs version checks
+  only (no authentication/cloud API), and verifies repeat installation preserves the SDK.

@@ -93,12 +93,83 @@ fn lock_coverage(text: &str, base: &str, version: &str, targets: &[String]) -> R
     Ok(())
 }
 
+fn rust_coverage(text: &str, version: &str, targets: &[String]) -> Result<(), String> {
+    let manifest: toml::Value =
+        toml::from_str(text).map_err(|_| "invalid official Rust manifest")?;
+    let rust = manifest
+        .get("pkg")
+        .and_then(|p| p.get("rust"))
+        .ok_or("Rust manifest omitted rust")?;
+    if rust
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .and_then(|v| v.split_whitespace().next())
+        != Some(version)
+    {
+        return Err("Rust manifest version mismatch".into());
+    }
+    for platform in targets {
+        let target = match platform.as_str() {
+            "macos-arm64" => "aarch64-apple-darwin",
+            "macos-x64" => "x86_64-apple-darwin",
+            "linux-arm64" => "aarch64-unknown-linux-gnu",
+            "linux-x64" => "x86_64-unknown-linux-gnu",
+            _ => return Err("unsupported Rust target".into()),
+        };
+        let release = rust
+            .get("target")
+            .and_then(|t| t.get(target))
+            .ok_or_else(|| format!("Rust has no {target} release"))?;
+        let hash = release
+            .get("xz_hash")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("");
+        let url = release
+            .get("xz_url")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("");
+        if release.get("available").and_then(toml::Value::as_bool) != Some(true)
+            || !url.starts_with("https://static.rust-lang.org/dist/")
+            || hash.len() != 64
+            || !hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(format!("no official Rust URL/checksum for {target}"));
+        }
+    }
+    Ok(())
+}
+
 fn check_mise(name: &str, spec: &str, targets: &[String]) -> Result<(), String> {
     crate::remote::ensure_mise();
     let scratch = Scratch::new()?;
     let spec = spec.strip_prefix("mise:").unwrap_or(spec);
     let (base, version) = split_spec(spec);
     let version = version.ok_or("an exact version is required")?;
+    // Rust's core backend installs through rustup and emits no mise lock entries.
+    // Read the official release manifest instead of rejecting a supported runtime.
+    if base == "core:rust" {
+        let url = format!("https://static.rust-lang.org/dist/channel-rust-{version}.toml");
+        let r = if have("curl") {
+            query(
+                &[
+                    "curl",
+                    "-fsSL",
+                    "--connect-timeout",
+                    "10",
+                    "--max-time",
+                    "25",
+                    &url,
+                ],
+                30,
+            )
+        } else {
+            query(&["wget", "-qO-", "-T", "25", &url], 30)
+        };
+        if r.code != 0 {
+            return Err("could not read the official pinned Rust release manifest".into());
+        }
+        return rust_coverage(&r.stdout, &version, targets);
+    }
     let config = format!(
         "[tools]\n{} = {}\n",
         Value::from(base.clone()),
@@ -299,6 +370,26 @@ pub fn command(names: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn official_rust_manifest_requires_pinned_available_targets_and_hashes() {
+        let text = format!("[pkg.rust]\nversion='1.99.0 (release)'\n[pkg.rust.target.aarch64-apple-darwin]\navailable=true\nxz_url='https://static.rust-lang.org/dist/rust.tar.xz'\nxz_hash='{}'\n", "a".repeat(64));
+        let target = ["macos-arm64".into()];
+        assert!(rust_coverage(&text, "1.99.0", &target).is_ok());
+        assert!(rust_coverage(&text, "1.99.1", &target).is_err());
+        assert!(rust_coverage(
+            &text.replace("available=true", "available=false"),
+            "1.99.0",
+            &target
+        )
+        .is_err());
+        assert!(rust_coverage(
+            &text.replace("static.rust-lang.org", "evil.example"),
+            "1.99.0",
+            &target
+        )
+        .is_err());
+        assert!(rust_coverage(&text, "1.99.0", &["linux-x64".into()]).is_err());
+    }
     #[test]
     fn require_every_target_and_checksum() {
         let hash = "a".repeat(64);

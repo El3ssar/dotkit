@@ -124,7 +124,12 @@ while IFS=$'\t' read -r name bin primary fallback; do
   [ -n "$name" ] || continue
   log="$KIT/state/install-$name.log"; : > "$log"
   # Keep working tools installed outside kit. Updates use their existing provider.
-  case "$primary" in builtin:*|blocked:*|system:*|cmd:*) ;; *)
+  case "$primary" in
+    builtin:gcloud@589.0.0)
+      existing=$(external_command "$bin" || true)
+      if [ -n "$existing" ] && runs "$existing"; then record "$name" available "external:$existing"; continue; fi
+      ;;
+    builtin:*|blocked:*|system:*|cmd:*) ;; *)
     existing=$(external_command "$bin" || true)
     case "$existing" in ""|"$KIT"/*) ;; *)
       if runs "$existing"; then say "$name: using existing $existing"; record "$name" available "external:$existing"; continue; fi
@@ -138,6 +143,11 @@ while IFS=$'\t' read -r name bin primary fallback; do
         if ! run_install "$log" bash "$P/remote/install-fizsh.sh"; then
           warn "$name failed: $log"; failed=1; record "$name" failed "$primary"; continue
         fi
+      fi
+      if [ "$primary" = builtin:gcloud@589.0.0 ]; then
+        if run_install "$log" bash "$P/remote/install-gcloud.sh" 589.0.0 && runs gcloud; then record "$name" installed "$primary"
+        else failed=1; record "$name" failed "$primary"; fi
+        continue
       fi
       if [ "$primary" = builtin:nvim ]; then install_spec aqua:neovim/neovim@0.12.6 "$log" || { failed=1; record "$name" failed "$primary"; continue; }; fi
       case "${primary#builtin:}" in fizsh) [ -x "$KIT/opt/fizsh/bin/fizsh" ] ;; zsh) runs zsh ;; nvim) runs nvim ;; mise) runs mise ;; *) false ;; esac && record "$name" installed "$primary" || { failed=1; record "$name" failed "$primary"; }
@@ -203,8 +213,7 @@ while IFS=$'\t' read -r rel url ref; do
   if [ "$safe" = 0 ] || [ -L "$parent/.git" ]; then warn "external parent/path blocks ~/$rel; left untouched"; failed=1; continue; fi
   dest="$HOME/$rel"
   if [ ! -e "$dest" ]; then
-    args=(git clone -q --depth 1); [ -z "$ref" ] || args+=(--branch "$ref")
-    run_install "$KIT/state/external-install.log" env "GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=15}" "${args[@]}" -- "$url" "$dest" || { warn "external clone failed: $rel"; failed=1; }
+    run_install "$KIT/state/external-install.log" bash "$P/remote/clone-external.sh" "$url" "$dest" "$ref" || { warn "external clone failed: $rel"; failed=1; }
   elif [ -d "$dest/.git" ] && [ "$(git -C "$dest" config --get remote.origin.url)" != "$url" ]; then
     warn "external $rel has a different origin; left untouched"; failed=1
   elif [ -d "$dest/.git" ] && [ -n "$ref" ]; then

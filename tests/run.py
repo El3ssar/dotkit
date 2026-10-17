@@ -89,7 +89,7 @@ class Sandbox:
         self.log.write_text("")
         (self.root / "gitconfig").write_text(
             "[user]\n\tname = Kit Tester\n\temail = kit@example.com\n[init]\n\tdefaultBranch = main\n"
-            "[advice]\n\tdetachedHead = false\n[pull]\n\trebase = false\n[protocol \"file\"]\n\tallow = always\n")
+            "[advice]\n\tdetachedHead = false\n[pull]\n\trebase = false\n[protocol \"file\"]\n\tallow = always\n[gc]\n\tauto = 0\n\tautoDetach = false\n[maintenance]\n\tauto = false\n\tautoDetach = false\n")
         for name_ in STUBS:
             self.make_stub(name_)
         self.stub("mise", script=MISE_USE_OK)
@@ -2680,6 +2680,22 @@ def status_groups_legacy_recipes_and_preserves_unsynced_details(sb):
     verbose = m.kit("status", "-v")
     has(verbose.out, "an exact version is required", "custom install commands are not managed")
     ok((m.src / "packages.json").read_bytes() == before, "status migrated recipes")
+
+
+@test
+def gcloud_uses_the_checksum_pinned_owned_recipe_without_plugins(sb):
+    m = setup(sb); sb.stub("mise", script=MISE_STUB); sb.stub("gcloud",code=0)
+    m.kit("add", "gcloud-cli")
+    entry=pkgs(m)["gcloud-cli"]
+    ok(entry["linux"] == "builtin:gcloud@589.0.0" and entry["mac"] == "builtin:gcloud@589.0.0", entry)
+    sb.stub("gcloud",code=0)
+    rows={p["name"]:p for p in json.loads(m.kit("packages","--json").out)}
+    ok(rows["gcloud-cli"]["installed"], rows)
+    m.repo_write("packages.json",json.dumps({"gcloud-cli":{"mac":"cask:gcloud-cli","linux":"vfox:jdx/vfox-gcloud@589.0.0","bin":"gcloud"}}))
+    m.kit("packages","resolve","gcloud-cli")
+    ok(pkgs(m)["gcloud-cli"]["mac"]=="cask:gcloud-cli")
+    ok(pkgs(m)["gcloud-cli"]["linux"]=="builtin:gcloud@589.0.0")
+    ok(not sb.calls("cargo") and not sb.calls("brew"),sb.calls())
 
 
 @test
