@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 /// The scripts that run on servers, built into kit.
 const REMOTE_FILES: &[(&str, &str)] = &[
     (
+        "install-gcloud.sh",
+        include_str!("../assets/remote/install-gcloud.sh"),
+    ),
+    (
+        "clone-external.sh",
+        include_str!("../assets/remote/clone-external.sh"),
+    ),
+    (
         "run-install.sh",
         include_str!("../assets/remote/run-install.sh"),
     ),

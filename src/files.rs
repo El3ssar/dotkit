@@ -1850,26 +1850,27 @@ pub fn apply_externals() {
         let dest = path_str(&home.join(&rel));
         let ok = if st == "missing" {
             say(&format!("cloning {url} into ~/{rel}"));
-            let mut args: Vec<String> = [
-                "git",
-                "-c",
-                "advice.detachedHead=false",
-                "clone",
-                "-q",
-                "--depth",
-                "1",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            if let Some(r) = &r#ref {
-                args.push("--branch".into());
-                args.push(r.clone());
-            }
-            args.push("--".into());
-            args.push(url.clone());
-            args.push(dest);
-            run_install(&format!("external-{rel}"), &args, None, Some(&git_env)).code == 0
+            let script = ctx().state.join("clone-external.sh");
+            write_atomic(
+                &script,
+                include_bytes!("../assets/remote/clone-external.sh"),
+                0o700,
+            )
+            .unwrap_or_else(|e| die(&format!("cannot prepare external clone: {e}")));
+            run_install(
+                &format!("external-{rel}"),
+                &[
+                    "bash",
+                    &path_str(&script),
+                    &url,
+                    &dest,
+                    r#ref.as_deref().unwrap_or(""),
+                ],
+                None,
+                Some(&git_env),
+            )
+            .code
+                == 0
         } else {
             let r = r#ref.clone().unwrap_or_default();
             say(&format!("updating ~/{rel} to {r}"));

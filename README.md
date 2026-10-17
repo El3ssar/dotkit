@@ -200,6 +200,14 @@ temporary provider files, removed afterward; Kit keeps no discovery database and
 background scan. Providers may maintain their own caches. `kit packages check [names...]`
 rechecks the current metadata and reports missing or unverified coverage without editing recipes.
 
+Google Cloud CLI also has a narrow Kit-owned recipe, `builtin:gcloud@589.0.0`, using
+versioned Google archives with pinned SHA-256 hashes and private Python 3.14.8. No Google
+installer, sudo, login, shell edits or arbitrary plugin is used. This bundled SDK version
+is updated through Kit releases; package update reports it as a bundled recipe rather
+than silently upgrading or reinstalling it. Existing external installations are kept.
+Rust core recipes validate the official pinned Rust release manifest because mise's Rust
+backend does not emit artifact lock entries.
+
 Cargo, npm, Go and Python packages are source/package builds: their provider is supported,
 but cross-platform build compatibility is **unverified** until tested on the destination.
 They are labeled accordingly, and `packages check` exits unsuccessfully for unverified builds.

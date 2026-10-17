@@ -205,6 +205,7 @@ pub(crate) fn package_bin_for<'a>(name: &'a str, p: &'a Pkg, platform: &str) -> 
     .or_else(|| s(p, "bin"))
     .unwrap_or(match name {
         "git-delta" => "delta",
+        "gcloud-cli" => "gcloud",
         "ripgrep" => "rg",
         "skim" => "sk",
         "neovim" => "nvim",
@@ -434,6 +435,25 @@ pub fn install_package(name: &str, p: &Pkg) -> bool {
     let Some(spec) = pkg_spec(p) else { return true };
     if let Some(problem) = crate::recipe::problem(spec) {
         fail(&format!("{name}: unsupported recipe {spec:?}: {problem}; replace it with kit add {name} --{} <mise-or-cargo-recipe>", ctx().platform));
+        return false;
+    }
+    if spec == "builtin:gcloud@589.0.0" {
+        crate::remote::ensure_mise();
+        let script = ctx().state.join("install-gcloud.sh");
+        write_atomic(
+            &script,
+            include_bytes!("../assets/remote/install-gcloud.sh"),
+            0o700,
+        )
+        .unwrap_or_else(|e| die(&format!("cannot prepare gcloud installer: {e}")));
+        let ok = run_install(name, &["bash", &path_str(&script), "589.0.0"], None, None).code == 0;
+        if ok && pkg_available(name, p) {
+            record_install(name, spec);
+            return true;
+        }
+        fail(&format!(
+            "{name}: private Google Cloud SDK installation failed"
+        ));
         return false;
     }
     // Legacy Kit-owned recipes are not mise backend identifiers. Keep the
@@ -787,6 +807,9 @@ fn portable_recipe(name: &str, mac: &str) -> Option<String> {
 }
 
 fn mise_backend(name: &str) -> Option<String> {
+    if matches!(name, "gcloud" | "gcloud-cli") {
+        return Some("builtin:gcloud@589.0.0".into());
+    }
     if name == "fizsh" {
         return Some("builtin:fizsh".into());
     }
@@ -931,7 +954,7 @@ pub fn add_tools(names: &[String], a: &Args) {
             && !crate::recipe::backend_supported(name)
             && !name.starts_with("brew:")
             && !name.starts_with("cask:")
-            && name != "builtin:fizsh"
+            && !matches!(name.as_str(), "builtin:fizsh" | "builtin:gcloud@589.0.0")
         {
             fail(&format!(
                 "{name}: use a supported mise, Cargo or Homebrew source"
@@ -945,7 +968,7 @@ pub fn add_tools(names: &[String], a: &Args) {
                 !crate::recipe::backend_supported(s)
                     && !s.starts_with("brew:")
                     && !s.starts_with("cask:")
-                    && s != "builtin:fizsh"
+                    && !matches!(s.as_str(), "builtin:fizsh" | "builtin:gcloud@589.0.0")
             })
         {
             fail(&format!("{name}: use a supported mise, Cargo or Homebrew recipe; system packages and custom install commands are not managed"));

@@ -61,6 +61,20 @@ def external_status_explains_newer_checkout_without_promising_downgrade(sb):
     h.ok(sb.git_raw(["rev-parse", "HEAD"], cwd=dest).stdout.strip() == second)
 
 
+def external_fresh_clone_accepts_exact_commit_and_failure_is_atomic(sb):
+    import shutil
+    m, upstream, dest, first, second = external_fixture(sb)
+    shutil.rmtree(dest)
+    m.repo_write("externals.json", json.dumps({"external": {"git": str(upstream), "ref": first}}))
+    m.kit("sync")
+    h.ok(sb.git_raw(["rev-parse", "HEAD"], cwd=dest).stdout.strip() == first)
+    h.ok((dest / "data").read_text() == "v1")
+    m.repo_write("externals.json", json.dumps({"absent": {"git": str(upstream), "ref": "0" * 40}}))
+    m.kit("sync", code=1)
+    h.ok(not (m.home / "absent").exists(), "failed clone left partial checkout")
+    h.ok(not list(m.home.glob("absent.kit-clone.*")), "failed clone leaked staging")
+
+
 def external_pin_accepts_forward_updates(sb):
     m, upstream, dest, first, second = external_fixture(sb)
     sb.git_raw(["checkout", "-q", first], cwd=dest)
@@ -191,7 +205,7 @@ def hooks_root_never_follows_symlinks_or_special_files(sb):
         h.ok(not m.exists("escaped"), "followed symlinked scripts root")
 
 
-TESTS = [external_status_explains_newer_checkout_without_promising_downgrade, hook_metadata_never_reads_fifos_or_symlinks, hooks_root_never_follows_symlinks_or_special_files, external_forward_update_preserves_branch_and_local_edits, hooks_are_noninteractive_logged_and_failures_rerun, hook_timeout_stops_background_children, undo_restores_original_private_file_permissions, undo_never_widens_private_parent_permissions, undo_restores_empty_directories_and_permissions, undo_restores_nested_empty_directories_and_modes, source_root_symlink_never_written, external_pin_rejects_unadvertised_newer_commits,
+TESTS = [external_fresh_clone_accepts_exact_commit_and_failure_is_atomic, external_status_explains_newer_checkout_without_promising_downgrade, hook_metadata_never_reads_fifos_or_symlinks, hooks_root_never_follows_symlinks_or_special_files, external_forward_update_preserves_branch_and_local_edits, hooks_are_noninteractive_logged_and_failures_rerun, hook_timeout_stops_background_children, undo_restores_original_private_file_permissions, undo_never_widens_private_parent_permissions, undo_restores_empty_directories_and_permissions, undo_restores_nested_empty_directories_and_modes, source_root_symlink_never_written, external_pin_rejects_unadvertised_newer_commits,
          external_pin_accepts_forward_updates, diff_symlink_target_cannot_inject_terminal_commands]
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(); parser.add_argument("--kit", default="target/debug/kit")

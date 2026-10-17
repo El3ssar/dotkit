@@ -26,7 +26,11 @@ pub fn problem(spec: &str) -> Option<String> {
     let spec = spec.strip_prefix("mise:").unwrap_or(spec);
     if matches!(
         spec,
-        "builtin:fizsh" | "builtin:zsh" | "builtin:nvim" | "builtin:mise"
+        "builtin:fizsh"
+            | "builtin:zsh"
+            | "builtin:nvim"
+            | "builtin:mise"
+            | "builtin:gcloud@589.0.0"
     ) {
         return None;
     }
@@ -103,6 +107,7 @@ mod tests {
             "cargo:eza@0.23.0",
             "mise:npm:@scope/tool@1.2.3",
             "builtin:fizsh",
+            "builtin:gcloud@589.0.0",
             "pypi:ruff@0.12.3",
             "pypi:example@1.2.0rc1.post2",
             "go:example.com/tool@v1.2.3",
@@ -110,6 +115,8 @@ mod tests {
             assert!(problem(s).is_none(), "{s}");
         }
         for s in [
+            "builtin:gcloud@latest",
+            "builtin:gcloud@588.0.0",
             "system:cbonsai",
             "cmd:echo yes",
             "asdf:plugin@1.0",
