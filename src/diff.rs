@@ -93,7 +93,11 @@ pub fn diff_text(
     } else {
         "/dev/null".into()
     };
-    let diff = TextDiff::from_lines(&a, &b);
+    // Browsing a file must not hang on pathological inputs. On timeout, similar
+    // emits a coarser but complete diff; it never changes the file contents.
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(200))
+        .diff_lines(&a, &b);
     let mut body = String::new();
     for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
         let text = hunk.to_string();
