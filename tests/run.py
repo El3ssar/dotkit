@@ -89,7 +89,7 @@ class Sandbox:
         self.log.write_text("")
         (self.root / "gitconfig").write_text(
             "[user]\n\tname = Kit Tester\n\temail = kit@example.com\n[init]\n\tdefaultBranch = main\n"
-            "[advice]\n\tdetachedHead = false\n[pull]\n\trebase = false\n[protocol \"file\"]\n\tallow = always\n")
+            "[advice]\n\tdetachedHead = false\n[pull]\n\trebase = false\n[protocol \"file\"]\n\tallow = always\n[gc]\n\tauto = 0\n\tautoDetach = false\n[maintenance]\n\tauto = false\n\tautoDetach = false\n")
         for name_ in STUBS:
             self.make_stub(name_)
         self.stub("mise", script=MISE_USE_OK)
