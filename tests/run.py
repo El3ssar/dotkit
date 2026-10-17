@@ -379,6 +379,20 @@ esac
 """.replace("INVENTORY_FIXTURE", shlex.quote(sys.executable) + " " + shlex.quote(str(HERE / "mise_inventory_fixture.py"))).replace("LOCK_FIXTURE", shlex.quote(sys.executable) + " " + shlex.quote(str(HERE / "mise_lock_fixture.py"))).replace("INSTALL_FIXTURE", shlex.quote(sys.executable) + " " + shlex.quote(str(HERE / "install_fixture.py")))
 
 
+def capture_registry_stub(sb, name, binary=None):
+    data=json.dumps([{"short":name,"backends":[f"aqua:owner/{name}",f"cargo:{name}"],"bins":[binary or name]}])
+    sb.stub("mise",script='case "$1:$2" in registry:--json) printf \'%s\\n\' '+shlex.quote(data)+'; exit 0;; esac\n'+MISE_STUB)
+
+
+def installed_brew_fixture(sb, name, binary=None, version="1.2.3"):
+    binary=binary or name;root=sb.root/"Cellar"/name/version
+    (root/"bin").mkdir(parents=True,exist_ok=True)
+    path=root/"bin"/binary;path.write_text("#!/bin/sh\nexit 0\n");path.chmod(0o755)
+    (root/"INSTALL_RECEIPT.json").write_text(json.dumps({"source":{"tap":"homebrew/core","spec":"stable"},"used_options":[]}))
+    active=sb.fakebin/binary;active.unlink(missing_ok=True);active.symlink_to(path)
+    sb.stub("brew",script='case "$1" in --prefix) echo '+shlex.quote(str(sb.root))+';; *) exit 1;; esac\n')
+
+
 def brew_metadata_stub(sb, name):
     info={"formulae":[{"name":name,"bottle":{"stable":{"files":{
         t:{"sha256":"a"*64,"url":"https://example.invalid/bottle"} for t in ("arm64_sequoia","sequoia","x86_64_linux","arm64_linux")}}}}],"casks":[]}
@@ -670,16 +684,12 @@ def add_tool_github_repo(sb):
 @test
 def add_tool_name_via_brew_info_and_mise_registry(sb):
     m = setup(sb)
-    sb.stub("mise", script=MISE_STUB)
-    sb.stub("brew", script="""case "$1" in
-  info) echo '{"formulae": [{"name": "lazygit"}], "casks": []}'; exit 0;;
-  *) exit 0;;
-esac
-""")
+    capture_registry_stub(sb,"lazygit");installed_brew_fixture(sb,"lazygit")
     m.kit("add", "lazygit")
     p = pkgs(m)["lazygit"]
-    ok(p["mac"] == "aqua:owner/lazygit@1.2.3", p)
-    ok(p["linux"] == "aqua:owner/lazygit@1.2.3", p)
+    ok(p[PLAT] == "brew:lazygit", p)
+    ok(p[OTHER] == "aqua:owner/lazygit@1.2.3", p)
+    ok(p["observed"][PLAT]["version"] == "1.2.3",p)
     ok(m.tracked() == [])
 
 
@@ -754,7 +764,7 @@ def add_tracked_tool_again_does_not_repin(sb):
     m = setup(sb); sb.stub("foo",code=0)
     baseline={"foo":{"mac":"aqua:o/foo@1.0","linux":"aqua:o/foo@1.0","linux_fallback":"cargo:foo@0.5.0"}}
     m.repo_write("packages.json",json.dumps(baseline))
-    has(m.kit("add","foo").out,"already tracked")
+    has(m.kit("add","foo",code=1).err,"could not prove an installed")
     ok(pkgs(m)==baseline)
     ok(not any(" latest " in c or " lock " in c for c in sb.calls("mise")),sb.calls())
 
@@ -2407,7 +2417,7 @@ def tracked_login_hooks_are_not_saved(sb):
 def package_registry_infers_command_name(sb):
     m = setup(sb)
     sb.stub("mise", script='''case "$1" in
- registry) echo '[{"short":"ripgrep","backends":["aqua:BurntSushi/ripgrep"],"bins":["rg"]}]';;
+ registry) echo '[{"short":"ripgrep","backends":["aqua:BurntSushi/ripgrep","cargo:ripgrep"],"bins":["rg"]}]';;
  latest) echo 15.2.0;;
  lock) LOCK_FIXTURE;;
  ls) INVENTORY_FIXTURE;;
@@ -2415,9 +2425,10 @@ def package_registry_infers_command_name(sb):
 esac
 exit 0
 '''.replace("INVENTORY_FIXTURE",shlex.quote(sys.executable)+" "+shlex.quote(str(HERE/"mise_inventory_fixture.py"))).replace("LOCK_FIXTURE",shlex.quote(sys.executable)+" "+shlex.quote(str(HERE/"mise_lock_fixture.py"))).replace("INSTALL_FIXTURE",shlex.quote(sys.executable)+" "+shlex.quote(str(HERE/"install_fixture.py"))))
+    installed_cargo_fixture(m,"ripgrep","rg",version="15.2.0")
     m.kit("add", "ripgrep")
     p = pkgs(m)["ripgrep"]
-    ok(p["bin"] == "rg" and p["linux"] == "aqua:BurntSushi/ripgrep@15.2.0", p)
+    ok(p["bin"] == "rg" and p[OTHER] == "aqua:BurntSushi/ripgrep@15.2.0" and p[PLAT] == "cargo:ripgrep@15.2.0", p)
 
 
 @test
@@ -2685,6 +2696,9 @@ def status_groups_legacy_recipes_and_preserves_unsynced_details(sb):
 @test
 def gcloud_uses_the_checksum_pinned_owned_recipe_without_plugins(sb):
     m = setup(sb); sb.stub("mise", script=MISE_STUB); sb.stub("gcloud",code=0)
+    sb.unstub("gcloud")
+    owned=m.write(".local/kit/bin/gcloud","#!/bin/sh\nexit 0\n");owned.chmod(0o755)
+    m.write(".local/kit/opt/gcloud/kit-version","589.0.0\n")
     m.kit("add", "gcloud-cli")
     entry=pkgs(m)["gcloud-cli"]
     ok(entry["linux"] == "builtin:gcloud@589.0.0" and entry["mac"] == "builtin:gcloud@589.0.0", entry)
@@ -2927,8 +2941,8 @@ def update_brew_checks_outdated_and_skips_current_or_missing_packages(sb):
 @test
 def add_existing_cargo_binary_records_its_actual_provider(sb):
     m = setup(sb); installed_cargo_fixture(m, "probe", "probe")
-    sb.stub("brew", code=0); sb.stub("mise", script=MISE_STUB)
-    m.kit("add", "probe", code=None if PLAT == "linux" else 0)
+    sb.stub("brew", code=0); capture_registry_stub(sb,"probe")
+    m.kit("add", "probe")
     ok(pkgs(m)["probe"][PLAT] == "cargo:probe@1.0.0", pkgs(m))
 
 

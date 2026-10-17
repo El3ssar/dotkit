@@ -133,6 +133,19 @@ fn inventory_json() {
     out(&serde_json::to_string_pretty(&rows).unwrap());
 }
 
+fn captured_note(p: &Pkg, platform: &str) -> String {
+    let Some(observed) = p.get("observed").and_then(|v| v.get(platform)) else {
+        return String::new();
+    };
+    let (Some(provider), Some(version)) = (
+        observed.get("provider").and_then(|v| v.as_str()),
+        observed.get("version").and_then(|v| v.as_str()),
+    ) else {
+        return String::new();
+    };
+    format!(" · captured {} {}", clean(provider), clean(version))
+}
+
 fn inventory() {
     let tracked = load_pkgs();
     out("Packages tracked for sync (Mac/Linux recipes; servers = kit push):");
@@ -156,9 +169,11 @@ fn inventory() {
         };
         out(&format!("  {name}  [{origin}]  {here}  servers: {servers}"));
         out(&format!(
-            "    mac: {}\n    linux: {}",
+            "    mac: {}{}\n    linux: {}{}",
             recipe(s(&p, "mac")),
-            recipe(s(&p, "linux"))
+            captured_note(&p, "mac"),
+            recipe(s(&p, "linux")),
+            captured_note(&p, "linux")
         ));
         out(&format!("    coverage: {}", crate::capability::summary(&p)));
         if let Some(fallback) = s(&p, "linux_fallback") {
@@ -797,8 +812,16 @@ Esc / ? closes help.".into()));
             } else {
                 frame.render_widget(
                     Paragraph::new(vec![
-                        Line::from(format!("macOS: {}", recipe(s(p, "mac")))),
-                        Line::from(format!("Linux: {}", recipe(s(p, "linux")))),
+                        Line::from(format!(
+                            "macOS: {}{}",
+                            recipe(s(p, "mac")),
+                            captured_note(p, "mac")
+                        )),
+                        Line::from(format!(
+                            "Linux: {}{}",
+                            recipe(s(p, "linux")),
+                            captured_note(p, "linux")
+                        )),
                         Line::from(format!(
                             "Coverage: {} (kit packages check {})",
                             crate::capability::summary(p),

@@ -15,6 +15,7 @@
 //! Per-machine state (what was last synced, backups, script runs) lives in
 //! ~/.local/state/kit, never in the repo.
 mod capability;
+mod capture;
 mod cli;
 mod complete;
 mod core;

@@ -125,3 +125,24 @@ require a verified replacement; no arbitrary command/plugin is re-enabled.
   clone logic. Failed clones leave no partial checkout. Existing checkout protection remains.
 - The gcloud cold-install test uses a temporary HOME and private tools, runs version checks
   only (no authentication/cloud API), and verifies repeat installation preserves the SDK.
+
+## Installed-source capture (0.4.0)
+
+Plain `kit add NAME` now captures the active installation from Cargo receipts,
+Homebrew receipts, or active mise metadata. It records the observed provider and
+version, preserves that provider locally, and checks a same-version binary
+counterpart for the other OS on Intel and ARM. It never installs or upgrades tools.
+Unknown ownership, unreproducible custom install options, and missing target
+artifacts reject the whole package batch without saving partial entries.
+
+Cargo crate metadata can identify its exact release's upstream repository when
+mise's catalog lacks a binary backend. This is a bounded, targeted request, not a
+persistent discovery cache. Homebrew follows its current formula on future installs;
+the captured version records what was observed, not a promise that Brew retains it.
+Artifact metadata verification does not prove runtime compatibility on every distro.
+Explicit source/platform recipes remain available for conditional source builds.
+
+Capture regression tests cover provider ownership, aliases, missing architectures,
+custom options, metadata special files, batch failure, concurrent manifest edits,
+no provisioning side effects, and updates with duplicate providers. The real
+provisioning smoke test also captures an installed mise tool on macOS and Linux.
