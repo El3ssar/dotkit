@@ -319,7 +319,7 @@ const HINTS: &[(&[&str], &str)] = &[
     (&["here", "deleted"], "keep this machine's version → kit save"),
     (&["repo", "missing"], "get the repo's version → kit sync"),
     (&["both"], "changed on both → kit sync merges them (or: kit save --force keeps yours, kit undo <file> takes the repo's)"),
-    (&["conflict"], "conflicts → edit the file, keep what you want between <<<<<<< and >>>>>>>, then kit save (or kit undo <file>)"),
+    (&["conflict"], "conflicts → kit files, then m to resolve sections; or edit the file and kit save"),
     (&["type"], "file vs folder → kit rm it, then kit add it again"),
 ];
 
@@ -949,9 +949,22 @@ pub fn cmd_save(a: &Args) {
 
 // --------------------------------------------------------------------------- writing the repo's version here
 /// 3-way merge with git: (merged text, number of conflicts) or None if git can't merge it.
-fn merge3(here: &[u8], base: &[u8], repo: &[u8]) -> Option<(Vec<u8>, i32)> {
-    let dir = ctx().state.join("merge");
-    let _ = fs::create_dir_all(&dir);
+pub(crate) fn merge3(here: &[u8], base: &[u8], repo: &[u8]) -> Option<(Vec<u8>, i32)> {
+    static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = ctx().state.join(format!(
+        "merge-{}-{}",
+        std::process::id(),
+        ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&ctx().state).ok()?;
+    fs::create_dir(&dir).ok()?;
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
     let (h, b, r) = (dir.join("here"), dir.join("base"), dir.join("repo"));
     fs::write(&h, here).ok()?;
     fs::write(&b, base).ok()?;
@@ -970,7 +983,6 @@ fn merge3(here: &[u8], base: &[u8], repo: &[u8]) -> Option<(Vec<u8>, i32)> {
         .args([&h, &b, &r])
         .output()
         .ok()?;
-    let _ = fs::remove_dir_all(&dir);
     let code = out.status.code()?;
     (0..=127).contains(&code).then_some((out.stdout, code))
 }
@@ -1107,11 +1119,11 @@ pub fn apply_files(prefixes: Option<&[String]>, force: bool) -> usize {
         }
         err_line(&c(
             "2",
-            "    keep what you want between <<<<<<< and >>>>>>>, then kit save",
+            "    kit files → 3 Conflicts → m resolve each section, then review and apply",
         ));
         err_line(&c(
             "2",
-            "    or: kit undo <file> takes the repo's · kit undo goes back to yours",
+            "    or edit the file, then kit save · kit undo <file> takes the repo's",
         ));
         set_exit(1);
     }

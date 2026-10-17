@@ -145,8 +145,8 @@ Toggle actions with `u` (update), `d` (stop syncing), `l` (resolve Linux recipes
 again undoes that action. Selections stay selected so you can apply several toggles to a batch.
 **SSH deployment** means whether `kit push` sends that tool to remote machines; it does not
 control local `kit sync`. An included tool still needs a Linux recipe before deployment.
-Pending values appear in blue, including the new included/excluded status. Enter applies all
-pending actions; `q` cancels, and `c` clears the queue and selections. Updates run before
+Pending values appear in blue, including the new included/excluded status. Enter opens a review;
+Enter in that review applies all pending actions; `q` cancels, and `c` clears the queue and selections. Updates run before
 removing entries when both actions are queued for the same package.
 The interface uses Ratatui with Crossterm for keyboard input, scrolling and incremental rendering.
 Press `?` for help, Tab to review every pending action, and `A` to clear selections without
@@ -179,24 +179,46 @@ is the explicit action for upgrades. Package changes remain local until `kit syn
 
 ## Manage your files
 
-`kit files` opens a Ratatui manager containing **tracked files only**. `kit files list` and
-`kit files --json` provide noninteractive inventories. Search with `/`, navigate with arrows
-or `j`/`k`, select with Space, and select every matching row with `a`.
+`kit files` opens a collapsible tree containing **tracked files only**. Folders are groups of
+tracked paths; opening the manager never discovers or tracks other files. Unchanged branches
+start collapsed and branches containing changes start open. Chains of single-child folders
+are compressed. `kit files list` and `kit files --json` keep their noninteractive inventories.
 
-- `v`: review the current file's diff (secrets and large files stay hidden).
-- `s`: stage saving this machine's version into the repo.
-- `r`: stage taking the repo's version, backing up the local copy first.
-- `p`: toggle inclusion for SSH/Linux deployment.
-- `d`: stage stopping tracking; the local file stays in place.
+- `←` / `→` (or `h` / `l`): collapse, expand, or move to a parent/child folder.
+- `O` / `C`: expand / collapse all folders. `n` / `N`: next / previous changed file.
+- `1` All, `2` Changed (including saved changes awaiting backup), `3` Conflicts, `4` Pending.
+- `/`: search paths. Matching branches are temporarily revealed; clearing search restores folds.
+- Space: select a file or a folder's matching tracked descendants. `a` selects every matching
+  file, including collapsed folders. `A` clears selection while preserving pending actions.
+- `v`: compare Saved in Kit (-) with Your machine (+). Wide terminals also show a preview beside
+  the tree. Arrows, Page Up/Down and Home/End scroll the full-screen comparison.
+- `s`: stage saving this machine's version. If both sides changed, this explicitly keeps the
+  machine's whole file; unresolved conflict markers must be resolved first.
+- `r`: stage using the repo's whole copy, backing up the local file first.
+- `m`: open the text conflict resolver for the cursor file.
+- `p`: toggle SSH/Linux inclusion. `d`: stop tracking and keep the local file.
 
-Pending values appear in blue. Each file can have several actions; saving and taking the
-repo's version are mutually exclusive. Repeat a toggle to undo it. Enter applies the queue,
-`c` clears it, and `q`/Escape cancels. Changes to a file or `.kitignore` while the manager is
-open require reopening it before applying. A failed copy stops the remaining actions. Saving a local deletion is labeled **save deletion**
-and requires reviewing the pending actions before applying. `?` opens help and Tab reviews the
-queue. Diffs scroll with arrows (including Left/Right for long lines), Page Up/Down and Home/End.
-The SSH/Linux column includes Linux platform exclusions; a macOS SSH destination evaluates
-macOS rules instead. Local `sync` inclusion still follows the current platform's rules.
+The resolver shows each conflicting section's machine and repo sides. `1` keeps the machine
+side, `2` keeps the repo side, and `3` keeps both **in that order**; this can require further
+editing for valid configuration syntax. `[` / `]` moves between sections, `0` clears a choice,
+and `v` previews the completed result. Enter queues a fully resolved result; Escape discards
+that merge session. Nonconflicting text is preserved. Two-sided edits can be merged here before
+sync writes markers. Files without a shared ancestor need an explicit whole-file choice.
+Binary, large, secret, non-UTF-8, or platform-transformed files may require an external editor.
+
+Blue values are pending; folder checkboxes show partial selections. Actions use **all selected
+files**, including those hidden by folding or filters; without a selection, they use the cursor
+file or matching descendants of the cursor folder. Counts and review include hidden actions.
+Enter or Tab opens the review; Enter there applies. `q`/Escape in the main list cancels everything;
+`c` clears selection and pending actions. No home/repo content is written before applying.
+Merge preparation uses temporary state files that are removed immediately.
+
+Applying a resolution backs up the original, writes the resolved local file, and saves it in Kit.
+`kit undo` restores the local backup. Changes to files or `.kitignore` while the manager is open
+require reopening before applying. A failed copy stops subsequent actions; a batch of files is
+not an atomic filesystem transaction. Saving a local deletion is labeled **save deletion**.
+Local sync follows the current platform rules; SSH/Linux inclusion controls deployment scope,
+while macOS SSH destinations evaluate their macOS rules. `?` opens the full keyboard help.
 
 ## Package sources and portability
 

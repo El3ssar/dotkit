@@ -441,14 +441,14 @@ Space toggles selection; a selects matching tracked packages; A clears selection
 
 u toggles update, checking the existing installation's provider before upgrading. d toggles untracking; installed programs stay. l toggles explicit missing/unsupported Linux recipe resolution. Existing supported recipes stay. s toggles inclusion in kit push; local sync is unaffected.
 
-Blue values are pending. More than one action can be queued per package. Tab reviews ALL pending actions, including hidden rows. Enter applies; q/Esc cancels the manager. Built-in dependencies are read-only.
+Blue values are pending. More than one action can be queued per package. Tab reviews ALL pending actions, including hidden rows. Enter opens review; Enter in review applies. q/Esc cancels the manager. Built-in dependencies are read-only.
 
 No provider queries or installation happen while browsing. `kit packages check` checks provider artifacts; source builds need destination testing.
 
 Esc / ? closes help.".into()));
                 self.overlay_scroll = 0;
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::Enter => {
                 let lines = self
                     .queued
                     .iter()
@@ -478,7 +478,6 @@ Esc / ? closes help.".into()));
                 self.overlay_scroll = 0;
             }
             KeyCode::Char('q') | KeyCode::Esc => return Some(Outcome::Cancel),
-            KeyCode::Enter => return Some(Outcome::Apply),
             KeyCode::Char('/') => {
                 self.searching = true;
                 self.query.clear();
@@ -544,7 +543,7 @@ Esc / ? closes help.".into()));
                     "Kit's built-in dependencies are read-only. Choose a tracked package.".into()
                 } else {
                     format!(
-                        "Toggled for {count} package(s). Blue = pending. Enter applies; q cancels."
+                        "Toggled for {count} package(s). Blue = pending. Enter reviews; q cancels."
                     )
                 };
             }
@@ -858,7 +857,7 @@ Esc / ? closes help.".into()));
                 Paragraph::new(vec![
                     Line::from("? help · Tab review · / search · Space select"),
                     Line::from(self.message.as_str()).cyan(),
-                    Line::from("Enter APPLY · q/Esc CANCEL · blue=pending").bold(),
+                    Line::from("Enter REVIEW · q/Esc CANCEL · blue=pending").bold(),
                 ]),
                 footer,
             );
@@ -873,7 +872,7 @@ Esc / ? closes help.".into()));
                         "u toggle update · d toggle tracking · l toggle resolve · s toggle SSH",
                     ),
                     Line::from(
-                        "Enter: APPLY QUEUED ACTIONS     q / Esc: CANCEL     c: clear queue",
+                        "Enter: REVIEW QUEUED ACTIONS     q / Esc: CANCEL     c: clear queue",
                     )
                     .bold(),
                 ])
@@ -1073,7 +1072,7 @@ mod tests {
         let screen = text(&terminal);
         assert!(screen.contains("probe-001"), "{screen}");
         assert!(screen.contains("1 hidden"), "{screen}");
-        assert!(screen.contains("Enter APPLY"), "{screen}");
+        assert!(screen.contains("Enter REVIEW"), "{screen}");
         assert!(screen.contains("? help"), "{screen}");
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Tab);
