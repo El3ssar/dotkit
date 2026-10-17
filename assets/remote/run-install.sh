@@ -6,7 +6,7 @@ log=$1 limit=$2
 shift 2
 case "$limit" in ''|*[!0-9]*|0) echo 'kit: install timeout must be a positive number of seconds' >&2; exit 2 ;; esac
 work=$(mktemp -d "${log}.runner.XXXXXX")
-mkfifo "$work/output" "$work/watchdog-ready"
+mkfifo "$work/output"
 # A FIFO keeps the logger out of the install's process group on Bash 3.2 too.
 set -m
 tee -a "$log" < "$work/output" &
@@ -18,7 +18,7 @@ worker=$!
   # Do not let a very fast worker make cleanup race process-group creation.
   # This handshake runs only after Bash has established the watchdog group;
   # every timer child subsequently inherits that group with job control off.
-  printf 'ready\n' > "$work/watchdog-ready"
+  : > "$work/watchdog-ready"
   sleep "$limit"
   echo timeout > "$work/timeout"
   echo "kit: installation exceeded ${limit}s; see $log" | tee -a "$log" >&2
@@ -44,8 +44,9 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
-IFS= read -r ready < "$work/watchdog-ready"
-[ "$ready" = ready ] || exit 1
+while [ ! -e "$work/watchdog-ready" ]; do
+  kill -0 "$watchdog" 2>/dev/null || exit 1
+done
 set +m
 rc=0
 wait "$worker" || rc=$?
